@@ -3,6 +3,19 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- `craftctl --create` no longer fails with `Permission denied` on
+  `/var/lock/craftctl/...` on fresh installs. The installer and `--setup`
+  now set the lock directory to mode `1777`, and locking falls back to a
+  per-user tmp directory when the system directory is not writable, with a
+  clear error instead of a misleading "Another operation is already running".
+- Progress logs (`log_info`) now go to stderr, so captured values such as
+  the Java path can no longer be polluted (previously `Using Java:` could
+  print embedded `[info]` lines).
+
 ## [1.0.0] - 2026-11-16
 
 ### Added

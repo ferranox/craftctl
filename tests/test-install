@@ -148,3 +148,44 @@ EOF
     kill $bgpid 2>/dev/null || true
     wait $bgpid 2>/dev/null || true
 }
+
+@test "log_info goes to stderr so captured values stay clean" {
+    local out
+    out="$(log_info "hello")"
+    [ -z "$out" ]
+    local err
+    err="$(log_info "hello" 2>&1 >/dev/null)"
+    [[ "$err" == *"hello"* ]]
+}
+
+@test "java path capture is not polluted by progress logs" {
+    ensure_java_for_version() {
+        log_info "Installing Java 25 runtime..."
+        log_info "Downloading Temurin 25 JRE for linux/aarch64..."
+        printf '/opt/java/temurin-25/bin/java\n'
+    }
+    export -f ensure_java_for_version
+    local java_bin
+    java_bin="$(ensure_java_for_version "26.3" 2>/dev/null)"
+    [ "$java_bin" = "/opt/java/temurin-25/bin/java" ]
+}
+
+@test "ensure_lock_dir falls back when system dir is unusable" {
+    need_root() { return 1; }
+    export -f need_root
+    export CRAFTCTL_LOCK_DIR="/proc/craftctl-locks-test-$$"
+    ensure_lock_dir
+    [ "$CRAFTCTL_LOCK_DIR" != "/proc/craftctl-locks-test-$$" ]
+    [[ -d "$CRAFTCTL_LOCK_DIR" && -w "$CRAFTCTL_LOCK_DIR" ]]
+}
+
+@test "with_server_lock works under fallback lock dir without leaking errors" {
+    need_root() { return 1; }
+    export -f need_root
+    export CRAFTCTL_LOCK_DIR="/proc/craftctl-locks-test-$$"
+    run with_server_lock "fbsrv" printf 'locked-ok\n'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"locked-ok"* ]]
+    [[ "$output" != *"Permission denied"* ]]
+    [[ "$output" != *"Another operation"* ]]
+}

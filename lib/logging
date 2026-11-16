@@ -24,7 +24,7 @@ _craftctl_color() {
 }
 
 log_info() {
-    _craftctl_color "0;34" "[info] $*"
+    _craftctl_color "0;34" "[info] $*" >&2
 }
 
 log_ok() {

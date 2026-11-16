@@ -8,22 +8,63 @@ server_lock_file() {
     printf '%s\n' "${CRAFTCTL_LOCK_DIR}/craftctl-${name}.lock"
 }
 
+# Ensure the lock directory is usable by the invoking user.
+# Fresh installs may leave /var/lock/craftctl root-owned; fix it via
+# need_root (consistent with other setup steps) or fall back to a per-user
+# tmp directory so normal users are never blocked. Updates CRAFTCTL_LOCK_DIR
+# when falling back.
+ensure_lock_dir() {
+    local dir="${CRAFTCTL_LOCK_DIR}"
+    if [[ -d "$dir" ]] && [[ -w "$dir" ]]; then
+        return 0
+    fi
+    if mkdir -p "$dir" 2>/dev/null && [[ -w "$dir" ]]; then
+        return 0
+    fi
+    if need_root mkdir -p "$dir" 2>/dev/null; then
+        need_root chmod 1777 "$dir" 2>/dev/null || true
+        if [[ -w "$dir" ]]; then
+            return 0
+        fi
+    fi
+    local fallback
+    fallback="${TMPDIR:-/tmp}/craftctl-locks-$(id -u)"
+    if mkdir -p "$fallback" 2>/dev/null && [[ -w "$fallback" ]]; then
+        CRAFTCTL_LOCK_DIR="$fallback"
+        export CRAFTCTL_LOCK_DIR
+        return 0
+    fi
+    return 1
+}
+
 with_server_lock() {
     local name="$1"
     shift
-    ensure_dir "$CRAFTCTL_LOCK_DIR" 2>/dev/null || true
+    if ! ensure_lock_dir; then
+        log_warn "Lock directory unavailable; running '${name}' operation without lock."
+        "$@"
+        return $?
+    fi
     local lock
     lock="$(server_lock_file "$name")"
-    ensure_dir "$(dirname "$lock")" 2>/dev/null || true
-    exec 9>"$lock" 2>/dev/null || { "$@"; return $?; }
-    if ! flock -n 9 2>/dev/null; then
-        log_error "Another operation is already running for server '${name}'."
-        exec 9>&-
+    # Braces group the redirection so a failure message cannot leak past
+    # 2>/dev/null (a bare `exec 9>"$lock" 2>/dev/null` still prints the
+    # redirection error to the original stderr).
+    if ! { exec 9>"$lock"; } 2>/dev/null; then
+        log_error "Cannot create lock file '${lock}': permission denied."
+        log_error "Fix: sudo mkdir -p '${CRAFTCTL_LOCK_DIR}' && sudo chmod 1777 '${CRAFTCTL_LOCK_DIR}'"
         return 1
+    fi
+    if has_cmd flock; then
+        if ! flock -n 9 2>/dev/null; then
+            log_error "Another operation is already running for server '${name}'."
+            exec 9>&- 2>/dev/null || true
+            return 1
+        fi
     fi
     "$@"
     local rc=$?
-    exec 9>&-
+    exec 9>&- 2>/dev/null || true
     return $rc
 }
 

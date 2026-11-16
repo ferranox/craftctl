@@ -28,14 +28,15 @@ cmd_setup() {
              "$CRAFTCTL_BACKUP_ROOT" "$CRAFTCTL_LOCK_DIR"; do
         need_root mkdir -p "$d" || return 1
     done
-    if is_root; then
-        chown -R "${CRAFTCTL_MC_USER}:root" "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true
-        chown -R "root:${CRAFTCTL_MC_USER}" "$CRAFTCTL_ETC" 2>/dev/null || true
-        chmod 2750 "$CRAFTCTL_ETC" 2>/dev/null || true
-        chmod 2750 "$CRAFTCTL_DATA" 2>/dev/null || true
-        chmod 2750 "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true
-        chmod 755 "$CRAFTCTL_LOCK_DIR" 2>/dev/null || true
-    fi
+    # Permissions are applied via need_root (not `if is_root`): setup is
+    # normally run as a sudo-capable user, not as root itself.
+    need_root chown -R "${CRAFTCTL_MC_USER}:root" "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true
+    need_root chown -R "root:${CRAFTCTL_MC_USER}" "$CRAFTCTL_ETC" 2>/dev/null || true
+    need_root chmod 2750 "$CRAFTCTL_ETC" 2>/dev/null || true
+    need_root chmod 2750 "$CRAFTCTL_DATA" 2>/dev/null || true
+    need_root chmod 2750 "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true
+    # Lock dir must stay writable by invoking users (sticky bit like /tmp).
+    need_root chmod 1777 "$CRAFTCTL_LOCK_DIR" 2>/dev/null || true
 
     # Global config defaults.
     local gconf

@@ -107,6 +107,9 @@ sudo mkdir -p "$APP_ROOT" "$ETC_DIR/servers" "$DATA_DIR" "$BACKUP_DIR" /var/lock
 sudo chown -R "${MC_USER}:root" "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
 sudo chown -R "root:${MC_USER}" "$ETC_DIR" 2>/dev/null || true
 sudo chmod 2750 "$ETC_DIR" "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+# Lock dir must be writable by the invoking (non-root) user; sticky bit
+# keeps users from removing each other's lock files.
+sudo chmod 1777 /var/lock/craftctl 2>/dev/null || true
 
 # --- 8/9. Download + install application files --------------------------------
 STAGE="$(mktemp -d /tmp/craftctl-install.XXXXXX)"

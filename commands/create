@@ -132,21 +132,11 @@ cmd_create() {
 }
 
 _create_locked() {
-    local name="$1" mc_version="$2" build="$3" memory="$4" port="$5" rport="$6" java_bin="$7"
-    ensure_dir "$CRAFTCTL_LOCK_DIR" 2>/dev/null || true
-    local lock
-    lock="$(server_lock_file "$name")"
-    ensure_dir "$(dirname "$lock")" 2>/dev/null || true
-    exec 9>"$lock" 2>/dev/null || true
-    if has_cmd flock && ! flock -n 9 2>/dev/null; then
-        log_error "Another operation is already running for server '${name}'."
-        exec 9>&- 2>/dev/null || true
-        return 1
-    fi
-    _do_create "$name" "$mc_version" "$build" "$memory" "$port" "$rport" "$java_bin"
-    local rc=$?
-    exec 9>&- 2>/dev/null || true
-    return $rc
+    local name="$1"
+    shift
+    # Single lock implementation lives in lib/server; this wrapper keeps the
+    # original call shape (_create_locked <name> <mc> <build> <mem> <port> <rport> <java>).
+    with_server_lock "$name" _do_create "$name" "$@"
 }
 
 _do_create() {

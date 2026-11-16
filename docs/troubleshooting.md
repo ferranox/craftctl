@@ -16,6 +16,9 @@
 - `PaperMC version 'X' does not exist`: run `craftctl --versions` for the
   exact list. Pre-releases (`-rc`, `-pre`) are hidden from `--versions` but
   can be requested explicitly if Fill provides builds.
+- `Permission denied` on `/var/lock/craftctl/...` (fixed in unreleased
+  versions after 1.0.0): re-run the installer or
+  `sudo mkdir -p /var/lock/craftctl && sudo chmod 1777 /var/lock/craftctl`.
 - `No STABLE build ... using latest build`: the version has no stable build
   yet (very new or very old). The newest build of any channel is used with a
   warning.
