@@ -15,6 +15,12 @@ setup() {
         # shellcheck disable=SC1090
         source "$_cf"
     done
+    # Never invoke real sudo in tests: stdin may be an open pipe on which
+    # sudo blocks forever. Run privileged operations directly (fixtures are
+    # owned by the test user). Tests covering the sudo branches stub
+    # need_root themselves after this setup.
+    need_root() { "$@"; }
+    export -f need_root
     mkdir -p "$CRAFTCTL_ETC/servers"
     # offline server fixture
     export TEST_SRV="wlsrv"

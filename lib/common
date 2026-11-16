@@ -76,6 +76,83 @@ need_root() {
     fi
 }
 
+# Effective invoking user (resolves through sudo for ownership decisions).
+invoking_user() {
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        printf '%s\n' "$SUDO_USER"
+    else
+        id -un
+    fi
+}
+
+# True if a path exists, escalating to sudo when it is not directly visible
+# (e.g. minecraft-owned 2750 directories on a real install).
+path_exists() {
+    [[ -e "${1:-}" ]] && return 0
+    need_root test -e "$1" 2>/dev/null
+}
+
+# Print a file to stdout, escalating to sudo when not directly readable.
+priv_cat() {
+    local file="${1:-}"
+    [[ -n "$file" ]] || return 1
+    if [[ -r "$file" ]]; then
+        cat "$file"
+    else
+        need_root cat "$file"
+    fi
+}
+
+# Install src file to dest with mode/owner, escalating via sudo when the
+# destination is not directly writable. Consumes (moves) src on success.
+priv_install() {
+    local src="$1" dest="$2" mode="${3:-644}" owner="${4:-}"
+    local dir
+    dir="$(dirname "$dest")"
+    if { [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null; } \
+        && [[ -w "$dir" ]] && { [[ ! -e "$dest" ]] || [[ -w "$dest" ]]; }; then
+        chmod "$mode" "$src" 2>/dev/null || true
+        mv -f "$src" "$dest" || return 1
+    else
+        need_root mkdir -p "$dir" || return 1
+        need_root cp -f "$src" "$dest" || return 1
+        rm -f "$src"
+        need_root chmod "$mode" "$dest" || return 1
+    fi
+    if [[ -n "$owner" ]]; then
+        local cur=""
+        cur="$(stat -c '%U:%G' "$dest" 2>/dev/null || true)"
+        if [[ "$owner" == *:* ]]; then
+            [[ "$cur" == "$owner" ]] || need_root chown "$owner" "$dest" 2>/dev/null || true
+        else
+            [[ "${cur%%:*}" == "$owner" ]] || need_root chown "$owner" "$dest" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Write stdin to dest atomically (mode/owner as in priv_install).
+priv_write() {
+    local dest="$1" mode="${2:-644}" owner="${3:-}"
+    local work
+    work="$(mktemp)" || return 1
+    if cat > "$work"; then
+        priv_install "$work" "$dest" "$mode" "$owner"
+        local rc=$?
+        rm -f "$work"
+        return $rc
+    fi
+    rm -f "$work"
+    return 1
+}
+
+# Remove files, escalating via sudo when not directly removable.
+priv_rm() {
+    if rm -f "$@" 2>/dev/null; then
+        return 0
+    fi
+    need_root rm -f "$@" 2>/dev/null
+}
+
 ensure_dir() {
     local dir="$1"
     local mode="${2:-}"

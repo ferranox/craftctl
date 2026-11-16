@@ -37,7 +37,17 @@ bats tests/test-commands
   (no `set -e` in `lib/*`).
 - Never `eval` user input. Quote all expansions. Validate server names,
   usernames, versions, memory and ports before use.
-- Atomic writes for config (`conf_set`, `atomic_write`).
+- Atomic writes for config (`conf_set`, `priv_write`/`priv_install`).
+- All reads/writes to system paths must work for a non-root invoking user:
+  use `priv_cat` (sudo-cat fallback), `priv_write`/`priv_install` (sudo
+  escalation), `tar_data` (tar as the `minecraft` user when direct access
+  fails) and `path_exists`/`server_exists` (sudo-aware checks). Non-secret
+  server files are `644` in traversable dirs so routine reads need no sudo;
+  secrets stay `640`/`600`.
+- Never invoke real `sudo` in Bats tests: when stdin is an open pipe, sudo
+  blocks forever instead of failing. Stub `need_root` pass-through in
+  `setup()` (already done in all suites) and cover sudo branches with
+  dedicated tests using a fake-privilege shim.
 - Per-server locking via `flock` (`with_server_lock`).
 - No colours when stdout is not a TTY (`NO_COLOR` respected).
 - Functions: `cmd_*` for commands, `*_for`/`ensure_*`/`find_*` in libs.

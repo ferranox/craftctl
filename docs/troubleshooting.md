@@ -45,6 +45,25 @@ craftctl --logs survival --lines 200
 - Out of memory on Pi: lower `--memory` (e.g. `1G`) and reduce
   `view-distance` in `server.properties`.
 
+## Permissions and "does not exist" errors
+
+New installs keep server data owned by `minecraft`, so commands escalate
+with `sudo` where needed. If you see `Permission denied`, wrong
+`Server 'X' does not exist`, `?` values in `list`/`info`, or false
+`Backup file not found` / `is corrupt` messages:
+
+1. Make sure your user has `sudo` access and re-run `craftctl --setup`
+   (it repairs ownership and modes, best effort).
+2. On versions before this model (≤1.0.0 lock fix): re-run the installer —
+   it is idempotent and preserves worlds/backups.
+3. Manual repair:
+   ```bash
+   sudo mkdir -p /var/lock/craftctl && sudo chmod 1777 /var/lock/craftctl
+   sudo chown -R minecraft:minecraft /var/lib/craftctl/servers/<name>
+   sudo chmod 2755 /var/lib/craftctl/servers/<name>
+   sudo chmod 644 /var/lib/craftctl/servers/<name>/config.conf
+   ```
+
 ## Whitelist / RCON
 
 - `No RCON credentials found`: `/etc/craftctl/servers/<name>.rcon` is

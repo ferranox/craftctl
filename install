@@ -104,9 +104,13 @@ else
     info "User '${MC_USER}' already exists."
 fi
 sudo mkdir -p "$APP_ROOT" "$ETC_DIR/servers" "$DATA_DIR" "$BACKUP_DIR" /var/lock/craftctl
-sudo chown -R "${MC_USER}:root" "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+# Ownership model: top-level containers are root-owned and traversable so
+# routine reads work without sudo; per-server dirs (created later) are
+# minecraft-owned. RCON credentials stay restricted to admins.
+sudo chown root:root /var/lib/craftctl "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+sudo chmod 755 /var/lib/craftctl "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
 sudo chown -R "root:${MC_USER}" "$ETC_DIR" 2>/dev/null || true
-sudo chmod 2750 "$ETC_DIR" "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+sudo chmod 2750 "$ETC_DIR" "$ETC_DIR/servers" 2>/dev/null || true
 # Lock dir must be writable by the invoking (non-root) user; sticky bit
 # keeps users from removing each other's lock files.
 sudo chmod 1777 /var/lock/craftctl 2>/dev/null || true
@@ -166,7 +170,8 @@ if [[ -f "$SRC/systemd/craftctl@.service" ]]; then
 fi
 
 # --- 12/13. Permissions + daemon-reload ----------------------------------------
-sudo chown -R "${MC_USER}:root" "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+sudo chown root:root /var/lib/craftctl "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+sudo chmod 755 /var/lib/craftctl "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
 sudo systemctl daemon-reload || warn "systemctl daemon-reload failed."
 
 # --- Default global config (never overwrite) -----------------------------------

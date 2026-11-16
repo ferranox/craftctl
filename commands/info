@@ -29,10 +29,15 @@ cmd_info() {
     if service_is_active "$name" 2>/dev/null; then status="running"; fi
     printf 'Status:        %s\n' "$status"
     local jar="${dir}/server.jar"
-    if [[ -f "$jar" ]]; then
-        printf 'JAR size:      %s\n' "$(du -h "$jar" 2>/dev/null | cut -f1)"
+    if path_exists "$jar" 2>/dev/null; then
+        local size=""
+        size="$(du -h "$jar" 2>/dev/null | cut -f1 || true)"
+        if [[ -z "$size" ]]; then
+            size="$(need_root du -h "$jar" 2>/dev/null | cut -f1 || true)"
+        fi
+        printf 'JAR size:      %s\n' "${size:-?}"
     fi
     local backups
-    backups="$(ls -1 "${CRAFTCTL_BACKUP_ROOT}/${name}" 2>/dev/null | wc -l | tr -d ' ')"
+    backups="$(list_backup_files "$name" 2>/dev/null | wc -l | tr -d ' ')"
     printf 'Backups:       %s\n' "${backups:-0}"
 }

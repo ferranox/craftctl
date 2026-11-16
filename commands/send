@@ -23,9 +23,8 @@ cmd_send() {
         log_error "No RCON client available (need 'mcrcon' or 'python3')."
         return 1
     fi
-    local out rc
-    out="$(rcon_send "$name" "$*")" || rc=$? || rc=$?
-    rc=${rc:-0}
+    local out rc=0
+    out="$(rcon_send "$name" "$*")" || rc=$?
     if [[ $rc -ne 0 ]]; then
         log_error "Failed to send command to '${name}'."
         [[ -n "${out:-}" ]] && printf '%s\n' "$out" >&2

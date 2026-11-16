@@ -35,14 +35,38 @@ CREATED=2026-01-01T00:00:00Z
 ```
 
 Managed by `craftctl --create` / `--update-server`. You may tune `MEMORY` or
-`JVM_FLAGS` manually then `craftctl --restart <name>`.
+`JVM_FLAGS` manually then `craftctl --restart <name>`. The file contains no
+secrets and is world-readable so `list`/`info` work without sudo.
 
 ## RCON credentials: `/etc/craftctl/servers/<name>.rcon`
 
 - Unique 32-hex-char password per server, generated at creation.
-- Mode `600`, owned by `minecraft`/`root` where possible.
+- Mode `600`, owned by the admin user who created the server. Reads fall
+  back to `sudo cat`, so other admins keep working (with a password prompt).
 - Bound to `127.0.0.1` only (`rcon.ip=127.0.0.1` in `server.properties`).
 - Never printed to logs or stdout. `rcon_send` scrubs it from output.
+
+## Permissions and sudo
+
+craftctl runs as your normal user; Minecraft processes run as `minecraft`.
+The ownership model keeps routine reads password-free while secrets stay
+restricted:
+
+| Path | Owner | Mode | Notes |
+|---|---|---|---|
+| `/var/lib/craftctl`, `/var/lib/craftctl/servers`, `/var/backups/craftctl` | `root:root` | `755` | traversable, no sudo needed to list |
+| `/var/lib/craftctl/servers/<name>/` | `minecraft:minecraft` | `2755` | traversable; files govern access |
+| `config.conf`, `whitelist.json`, `eula.txt` | `minecraft:minecraft` | `644` | no secrets; readable without sudo |
+| `server.properties`, backup archives | `minecraft:minecraft` | `640` | contain the RCON password |
+| `/etc/craftctl/` | `root:minecraft` | `2750` | global config `644`, RCON creds `600` |
+| `/var/lock/craftctl` | any | `1777` | sticky, like `/tmp` |
+
+All writes to system locations escalate via `sudo` automatically
+(`priv_write`/`priv_install`/`tar_data` helpers); reads fall back to
+`sudo cat` only for the restricted files above. If `sudo` is unavailable
+and files are not directly accessible, commands fail with a clear error
+instead of corrupt output. `--setup` migrates pre-existing installs to
+this model (best effort).
 
 ## server.properties
 

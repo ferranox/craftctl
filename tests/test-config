@@ -15,6 +15,12 @@ setup() {
         # shellcheck disable=SC1090
         source "$_cf"
     done
+    # Never invoke real sudo in tests: stdin may be an open pipe on which
+    # sudo blocks forever. Run privileged operations directly (fixtures are
+    # owned by the test user). Tests covering the sudo branches stub
+    # need_root themselves after this setup.
+    need_root() { "$@"; }
+    export -f need_root
     mkdir -p "$CRAFTCTL_ETC/servers"
 }
 
@@ -121,4 +127,57 @@ teardown() {
     [ "$(conf_get "$(server_conf_path s2)" JAVA_BIN)" = "/j17" ]
     run port_in_use_by_other "25565" "s2"
     [ "$status" -eq 0 ]
+}
+
+@test "priv_write direct branch never escalates" {
+    called="$(mktemp)"
+    need_root() { printf 'CALLED\n' >> "$called"; return 1; }
+    export -f need_root
+    f="${CRAFTCTL_ETC}/direct.txt"
+    printf 'hello\n' | priv_write "$f" 644 ""
+    [ "$(cat "$f")" = "hello" ]
+    [ "$(stat -c %a "$f")" = "644" ]
+    [ ! -s "$called" ]
+    rm -f "$called"
+}
+
+@test "conf_set and conf_get work through the sudo branch" {
+    # Simulate a real install: fixture dir unreadable/unwritable by the
+    # invoking user. Fake sudo emulates privilege by restoring write access.
+    sysroot="$(mktemp -d)"
+    export FAKE_SYSROOT="$sysroot"
+    mkdir -p "$sysroot/sub"
+    printf 'A=1\nB=2\n' > "$sysroot/sub/c.conf"
+    chmod 555 "$sysroot" "$sysroot/sub"
+    chmod 444 "$sysroot/sub/c.conf"
+    need_root() {
+        chmod -R u+w "$FAKE_SYSROOT" 2>/dev/null || true
+        "$@"
+    }
+    export -f need_root
+    conf_set "$sysroot/sub/c.conf" B "3"
+    [ "$(conf_get "$sysroot/sub/c.conf" B)" = "3" ]
+    [ "$(conf_get "$sysroot/sub/c.conf" A)" = "1" ]
+    chmod -R u+w "$sysroot"
+    rm -rf "$sysroot"
+}
+
+@test "server_exists works when dirs need sudo to inspect" {
+    sysroot="$(mktemp -d)"
+    export FAKE_SYSROOT="$sysroot"
+    export CRAFTCTL_DATA="$sysroot/data"
+    mkdir -p "$CRAFTCTL_DATA/srv1"
+    printf 'SERVER_NAME=srv1\n' > "$CRAFTCTL_DATA/srv1/config.conf"
+    chmod 000 "$CRAFTCTL_DATA/srv1"
+    # Direct checks fail on the locked-down dir; fake sudo restores access.
+    # (chmod -R alone cannot recurse into a 000 dir, so open each level.)
+    need_root() {
+        chmod u+rwx "$FAKE_SYSROOT" "$FAKE_SYSROOT/data" "$FAKE_SYSROOT/data/srv1" 2>/dev/null || true
+        "$@"
+    }
+    export -f need_root
+    server_exists "srv1"
+    ! server_exists "nosuch"
+    chmod -R u+rwx "$sysroot" 2>/dev/null || chmod u+rwx "$sysroot" "$sysroot/data" "$sysroot/data/srv1" 2>/dev/null || true
+    rm -rf "$sysroot"
 }

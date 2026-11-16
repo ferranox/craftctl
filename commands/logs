@@ -27,9 +27,12 @@ cmd_logs() {
     unit="$(service_name_for "$name")"
     if has_cmd journalctl && systemctl_cmd status "$unit" >/dev/null 2>&1; then
         if [[ $follow -eq 1 ]]; then
-            journalctl -u "$unit" -n "$lines" -f --no-pager
+            journalctl -u "$unit" -n "$lines" -f --no-pager 2>/dev/null \
+                || need_root journalctl -u "$unit" -n "$lines" -f --no-pager
         else
-            journalctl -u "$unit" -n "$lines" --no-pager 2>/dev/null || _file_logs "$name" "$lines" "$follow"
+            journalctl -u "$unit" -n "$lines" --no-pager 2>/dev/null \
+                || need_root journalctl -u "$unit" -n "$lines" --no-pager 2>/dev/null \
+                || _file_logs "$name" "$lines" "$follow"
         fi
         return 0
     fi
@@ -40,13 +43,21 @@ _file_logs() {
     local name="$1" lines="$2" follow="$3"
     local f
     f="$(server_log_path "$name")"
-    if [[ ! -f "$f" ]]; then
+    if ! path_exists "$f" 2>/dev/null; then
         log_error "No log file found at ${f}. Is the server installed correctly?"
         return 1
     fi
     if [[ "$follow" -eq 1 ]]; then
-        tail -n "$lines" -f "$f"
+        if [[ -r "$f" ]]; then
+            tail -n "$lines" -f "$f"
+        else
+            need_root tail -n "$lines" -f "$f"
+        fi
     else
-        tail -n "$lines" "$f"
+        if [[ -r "$f" ]]; then
+            tail -n "$lines" "$f"
+        else
+            need_root tail -n "$lines" "$f"
+        fi
     fi
 }

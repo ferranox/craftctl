@@ -124,17 +124,16 @@ ensure_whitelist_file() {
     local name="$1"
     local f
     f="$(whitelist_file "$name")"
-    if [[ ! -f "$f" ]]; then
-        printf '[]\n' | atomic_write "$f" 640
-        if is_root && id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
-            chown "${CRAFTCTL_MC_USER}:root" "$f" 2>/dev/null || true
+    if path_exists "$f" 2>/dev/null; then
+        if priv_cat "$f" 2>/dev/null | jq -e 'type == "array"' >/dev/null 2>&1; then
+            return 0
         fi
-        return 0
-    fi
-    if ! jq -e 'type == "array"' "$f" >/dev/null 2>&1; then
         log_error "whitelist.json for '${name}' is corrupt (not a JSON array)."
         return 1
     fi
+    # Player names are not secret; keep world-readable so offline listing
+    # works without sudo.
+    printf '[]\n' | priv_write "$f" 644 "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" || return 1
 }
 
 offline_whitelist_add() {
@@ -143,22 +142,19 @@ offline_whitelist_add() {
     local f
     f="$(whitelist_file "$name")"
     ensure_whitelist_file "$name" || return 1
-    if jq -e --arg u "$user" '.[] | select(.name == $u)' "$f" >/dev/null 2>&1; then
+    if priv_cat "$f" 2>/dev/null | jq -e --arg u "$user" '.[] | select(.name == $u)' >/dev/null 2>&1; then
         log_info "Player '${user}' is already whitelisted on '${name}'."
         return 0
     fi
     # uuid may be empty (offline mode without Mojang lookup); store entry anyway.
     local tmp
     tmp="$(mktemp)" || return 1
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmp'" RETURN
     if [[ -n "$uuid" ]]; then
-        jq --arg u "$user" --arg id "$uuid" '. + [{uuid: $id, name: $u}]' "$f" > "$tmp" || return 1
+        priv_cat "$f" 2>/dev/null | jq --arg u "$user" --arg id "$uuid" '. + [{uuid: $id, name: $u}]' > "$tmp" || { rm -f "$tmp"; return 1; }
     else
-        jq --arg u "$user" '. + [{name: $u}]' "$f" > "$tmp" || return 1
+        priv_cat "$f" 2>/dev/null | jq --arg u "$user" '. + [{name: $u}]' > "$tmp" || { rm -f "$tmp"; return 1; }
     fi
-    cat "$tmp" > "$f" || return 1
-    trap - RETURN
+    priv_install "$tmp" "$f" 644 "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 }
 
@@ -167,17 +163,14 @@ offline_whitelist_remove() {
     local f
     f="$(whitelist_file "$name")"
     ensure_whitelist_file "$name" || return 1
-    if ! jq -e --arg u "$user" '.[] | select(.name == $u)' "$f" >/dev/null 2>&1; then
+    if ! priv_cat "$f" 2>/dev/null | jq -e --arg u "$user" '.[] | select(.name == $u)' >/dev/null 2>&1; then
         log_info "Player '${user}' is not whitelisted on '${name}'."
         return 0
     fi
     local tmp
     tmp="$(mktemp)" || return 1
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmp'" RETURN
-    jq --arg u "$user" 'map(select(.name != $u))' "$f" > "$tmp" || return 1
-    cat "$tmp" > "$f" || return 1
-    trap - RETURN
+    priv_cat "$f" 2>/dev/null | jq --arg u "$user" 'map(select(.name != $u))' > "$tmp" || { rm -f "$tmp"; return 1; }
+    priv_install "$tmp" "$f" 644 "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 }
 

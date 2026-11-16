@@ -18,10 +18,17 @@ cmd_restore() {
     validate_server_name "$name" || return 1
     server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
     if [[ -z "$file" ]]; then
-        file="$(_latest_backup "$name")" || { log_error "No backups found for '${name}'."; return 1; }
+        file="$(list_backup_files "$name" | head -n 1)" || { log_error "No backups found for '${name}'."; return 1; }
+        if [[ -z "$file" ]]; then
+            log_error "No backups found for '${name}'."
+            return 1
+        fi
         log_info "Using latest backup: ${file}"
     fi
-    [[ -f "$file" ]] || { log_error "Backup file not found: ${file}"; return 1; }
+    if ! path_exists "$file" 2>/dev/null; then
+        log_error "Backup file not found: ${file}"
+        return 1
+    fi
     # Safety: backup file must be inside our backup root or explicitly given absolute path.
     if [[ "$file" != /* ]]; then
         log_error "Backup --file must be an absolute path."
@@ -42,11 +49,6 @@ cmd_restore() {
     with_server_lock "$name" _do_restore "$name" "$file"
 }
 
-_latest_backup() {
-    local name="$1"
-    ls -1t "${CRAFTCTL_BACKUP_ROOT}/${name}"/"${name}"-*.tar.gz 2>/dev/null | head -n 1
-}
-
 _do_restore() {
     local name="$1" file="$2"
     local dir
@@ -55,7 +57,7 @@ _do_restore() {
         "${CRAFTCTL_DATA}/"*) ;;
         *) log_error "Refusing to restore into unexpected path: ${dir}"; return 1 ;;
     esac
-    if ! tar -tzf "$file" >/dev/null 2>&1; then
+    if ! tar_data -tzf "$file" >/dev/null; then
         log_error "Backup file is corrupt or not a valid tar.gz: ${file}"
         return 1
     fi
@@ -63,26 +65,20 @@ _do_restore() {
     local safety
     safety="${CRAFTCTL_BACKUP_ROOT}/${name}/${name}-pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
     log_info "Creating safety backup of current state..."
-    if ! tar -czf "$safety" --exclude='./logs' -C "$dir" ./ 2>/dev/null; then
+    if ! tar_data -czf "$safety" --exclude='./logs' -C "$dir" ./; then
         log_warn "Could not create pre-restore safety backup (continuing)."
         safety=""
     else
+        need_root chmod 640 "$safety" 2>/dev/null || chmod 640 "$safety" 2>/dev/null || true
         log_info "Safety backup: ${safety}"
     fi
     log_info "Restoring ${file} into ${dir}..."
-    # Extract over the directory, preserving ownership afterwards.
-    if is_root; then
-        if ! runuser -u "$CRAFTCTL_MC_USER" -- tar -xzf "$file" -C "$dir" 2>/dev/null; then
-            log_error "Restore failed."
-            return 1
-        fi
-        chown -R "${CRAFTCTL_MC_USER}:root" "$dir" 2>/dev/null || true
-    else
-        if ! tar -xzf "$file" -C "$dir"; then
-            log_error "Restore failed."
-            return 1
-        fi
+    # Extract preserving ownership afterwards.
+    if ! tar_data -xzf "$file" -C "$dir"; then
+        log_error "Restore failed."
+        return 1
     fi
+    need_root chown -R "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" "$dir" 2>/dev/null || true
     log_ok "Server '${name}' restored from ${file}."
     if [[ -n "$safety" ]]; then
         log_info "Previous state preserved in: ${safety}"

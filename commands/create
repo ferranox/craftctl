@@ -167,13 +167,11 @@ _do_create() {
     # server.properties + eula need to be owned by minecraft.
     write_server_properties "$dir" "$port" "$rport" "$rcon_pass" || return 1
     accept_eula "$dir" || return 1
-    printf '[]\n' > "${dir}/whitelist.json" 2>/dev/null || true
+    printf '[]\n' | priv_write "${dir}/whitelist.json" 644 "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" 2>/dev/null || true
 
-    if is_root; then
-        chown -R "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" "$dir" 2>/dev/null || chown -R "${CRAFTCTL_MC_USER}" "$dir" 2>/dev/null || true
-        chown -R "${CRAFTCTL_MC_USER}:root" "${CRAFTCTL_BACKUP_ROOT}/${name}" 2>/dev/null || true
-        chmod 2750 "$dir" 2>/dev/null || true
-    fi
+    need_root chown -R "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" "$dir" 2>/dev/null || return 1
+    need_root chown -R "${CRAFTCTL_MC_USER}:root" "${CRAFTCTL_BACKUP_ROOT}/${name}" 2>/dev/null || true
+    need_root chmod 2755 "$dir" 2>/dev/null || true
 
     # Reload systemd so the template instance can start (template is generic,
     # but a daemon-reload is harmless and keeps status output accurate).

@@ -104,12 +104,10 @@ _do_update_server() {
     trap "rm -rf '$(dirname "$tmpjar")'" RETURN
     papermc_download_jar "$mc_version" "$build" "$tmpjar" || { [[ $was_running -eq 1 ]] && service_start "$name" 2>/dev/null || true; return 1; }
     trap - RETURN
-    cp "$tmpjar" "${dir}/server.jar.new" || return 1
-    mv -f "${dir}/server.jar.new" "${dir}/server.jar" || return 1
+    need_root cp -f "$tmpjar" "${dir}/server.jar.new" || return 1
+    need_root mv -f "${dir}/server.jar.new" "${dir}/server.jar" || return 1
     rm -rf "$(dirname "$tmpjar")"
-    if is_root && id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
-        chown "${CRAFTCTL_MC_USER}:root" "${dir}/server.jar" 2>/dev/null || true
-    fi
+    need_root chown "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" "${dir}/server.jar" 2>/dev/null || true
 
     conf_set "$conf" MC_VERSION "$mc_version" || return 1
     conf_set "$conf" PAPER_BUILD "$build" || return 1
@@ -139,11 +137,12 @@ _do_backup_inline() {
         rcon_send "$name" "save-all flush" >/dev/null 2>&1 || rcon_send "$name" "save-all" >/dev/null 2>&1 || true
         sleep 2
     fi
-    tar -czf "$file" --exclude='./logs' -C "$dir" ./ 2>/dev/null
+    tar_data -czf "$file" --exclude='./logs' -C "$dir" ./
     local rc=$?
     [[ $online -eq 1 ]] && rcon_send "$name" "save-on" >/dev/null 2>&1 || true
-    if [[ $rc -ne 0 ]]; then rm -f "$file"; return 1; fi
-    tar -tzf "$file" >/dev/null 2>&1 || { rm -f "$file"; return 1; }
+    if [[ $rc -ne 0 ]]; then priv_rm "$file"; return 1; fi
+    tar_data -tzf "$file" >/dev/null || { priv_rm "$file"; return 1; }
+    need_root chmod 640 "$file" 2>/dev/null || chmod 640 "$file" 2>/dev/null || true
     log_info "Pre-update backup: ${file}"
     load_global_config
     _prune_backups "$name" "${BACKUP_RETENTION:-7}" 2>/dev/null || true

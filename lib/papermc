@@ -9,6 +9,7 @@ fill_curl() {
     local out="$2"
     local ua="craftctl/${CRAFTCTL_VERSION} (https://github.com/ferranox/craftctl)"
     curl -fsSL --connect-timeout 15 --max-time 60 \
+        --retry 3 --retry-delay 2 \
         -H "User-Agent: ${ua}" \
         -o "$out" "$url"
 }
@@ -119,10 +120,12 @@ papermc_download_jar() {
     info="$(papermc_build_info "$ver" "$build")" || return 1
     url="$(printf '%s' "$info" | awk '{print $1}')"
     sha="$(printf '%s' "$info" | awk '{print $2}')"
-    local tmp="${dest}.download.$$"
+    local tmp
+    tmp="$(mktemp "$(dirname "$dest")/.download.XXXXXX")" || return 1
     local ua="craftctl/${CRAFTCTL_VERSION} (https://github.com/ferranox/craftctl)"
     log_info "Downloading PaperMC ${ver} build ${build}..."
-    if ! curl -fL --connect-timeout 15 --max-time 600 -H "User-Agent: ${ua}" -o "$tmp" "$url"; then
+    if ! curl -fL --connect-timeout 15 --max-time 600 --retry 3 --retry-delay 2 \
+        -H "User-Agent: ${ua}" -o "$tmp" "$url"; then
         rm -f "$tmp"
         log_error "Download failed for Paper ${ver} build ${build}."
         return 1

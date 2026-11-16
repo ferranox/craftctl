@@ -52,31 +52,25 @@ _do_backup() {
     log_info "Creating backup ${file}..."
     local rc=0
     # Exclude logs and cache to keep backups small on Raspberry Pi.
-    if is_root; then
-        runuser -u "$CRAFTCTL_MC_USER" -- tar -czf "$file" \
-            --exclude='./logs' --exclude='./cache' --exclude='./*.log.gz' \
-            -C "$dir" ./ 2>/dev/null || rc=$?
-    else
-        tar -czf "$file" --exclude='./logs' --exclude='./cache' \
-            --exclude='./*.log.gz' -C "$dir" ./ 2>/dev/null || rc=$?
-    fi
+    # tar_data acts as the minecraft user when we lack direct access.
+    tar_data -czf "$file" \
+        --exclude='./logs' --exclude='./cache' --exclude='./*.log.gz' \
+        -C "$dir" ./ || rc=$?
 
     if [[ $online -eq 1 ]]; then
         rcon_send "$name" "save-on" >/dev/null 2>&1 || true
     fi
     if [[ $rc -ne 0 ]]; then
         log_error "Backup failed for '${name}'."
-        rm -f "$file"
+        priv_rm "$file"
         return 1
     fi
-    if ! tar -tzf "$file" >/dev/null 2>&1; then
+    if ! tar_data -tzf "$file" >/dev/null; then
         log_error "Backup verification failed (archive is corrupt): ${file}"
-        rm -f "$file"
+        priv_rm "$file"
         return 1
     fi
-    if is_root && id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
-        chown "${CRAFTCTL_MC_USER}:root" "$file" 2>/dev/null || true
-    fi
+    need_root chmod 640 "$file" 2>/dev/null || chmod 640 "$file" 2>/dev/null || true
     log_ok "Backup created: ${file}"
     _prune_backups "$name" "$keep"
 }
@@ -84,17 +78,17 @@ _do_backup() {
 _prune_backups() {
     local name="$1" keep="$2"
     local backup_dir="${CRAFTCTL_BACKUP_ROOT}/${name}"
-    [[ -d "$backup_dir" ]] || return 0
+    path_exists "$backup_dir" 2>/dev/null || return 0
     local files=()
     while IFS= read -r f; do
         [[ -n "$f" ]] && files+=("$f")
-    done < <(ls -1t "${backup_dir}"/"${name}"-*.tar.gz 2>/dev/null)
+    done < <(list_backup_files "$name")
     local total=${#files[@]}
     if [[ $total -gt $keep ]]; then
         local i
         for (( i=keep; i<total; i++ )); do
             log_info "Pruning old backup: ${files[$i]}"
-            rm -f "${files[$i]}"
+            priv_rm "${files[$i]}"
         done
     fi
 }

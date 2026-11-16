@@ -44,9 +44,11 @@ load_conf_file() {
 }
 
 # Read a single key from a conf file without polluting environment.
+# Falls back to sudo when the file is not directly readable (real installs
+# keep server configs owned by the minecraft user).
 conf_get() {
     local file="$1" key="$2"
-    [[ -f "$file" ]] || return 1
+    path_exists "$file" 2>/dev/null || return 1
     local line
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -63,11 +65,13 @@ conf_get() {
             printf '%s\n' "$value"
             return 0
         fi
-    done < "$file"
+    done < <(priv_cat "$file" 2>/dev/null)
     return 1
 }
 
 # Set or update a single KEY=VALUE in a conf file atomically.
+# Works whether or not the file is directly writable (escalates via sudo
+# when needed) and preserves the existing file mode/owner.
 conf_set() {
     local file="$1" key="$2" value="$3"
     if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
@@ -79,11 +83,10 @@ conf_set() {
         log_error "Invalid config value: must not contain newlines."
         return 1
     fi
-    local tmp
-    tmp="$(mktemp "$(dirname "$file")/.tmp.XXXXXX")" || return 1
-    if [[ -f "$file" ]]; then
-        # shellcheck disable=SC2016
-        awk -v k="$key" -v v="$value" '
+    local work
+    work="$(mktemp)" || return 1
+    if path_exists "$file" 2>/dev/null; then
+        if ! priv_cat "$file" 2>/dev/null | awk -v k="$key" -v v="$value" '
             BEGIN { done=0 }
             {
                 line=$0
@@ -97,12 +100,32 @@ conf_set() {
                 }
             }
             END { if (done==0) print k "=" v }
-        ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+        ' > "$work"; then
+            rm -f "$work"
+            return 1
+        fi
+        if [[ ! -s "$work" ]]; then
+            # Could not read the existing file (privilege failure after the
+            # existence check); refuse to overwrite it with a single key.
+            log_error "Cannot read '${file}' to update it."
+            rm -f "$work"
+            return 1
+        fi
     else
-        printf '%s=%s\n' "$key" "$value" > "$tmp" || { rm -f "$tmp"; return 1; }
+        printf '%s=%s\n' "$key" "$value" > "$work" || { rm -f "$work"; return 1; }
     fi
-    chmod 640 "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    # Preserve existing mode/owner; default 644 for new files.
+    local mode="644" owner=""
+    local stat_out=""
+    stat_out="$(stat -c '%a %U %G' "$file" 2>/dev/null || need_root stat -c '%a %U %G' "$file" 2>/dev/null || true)"
+    if [[ -n "$stat_out" ]]; then
+        local s_mode s_user s_group
+        read -r s_mode s_user s_group <<< "$stat_out"
+        [[ -n "${s_mode:-}" ]] && mode="$s_mode"
+        [[ -n "${s_user:-}" && -n "${s_group:-}" ]] && owner="${s_user}:${s_group}"
+    fi
+    priv_install "$work" "$file" "$mode" "$owner" || { rm -f "$work"; return 1; }
+    rm -f "$work"
 }
 
 # Load global config with defaults.
@@ -124,6 +147,15 @@ load_global_config() {
         v="$(conf_get "$f" JAVA_DIR 2>/dev/null)" && JAVA_DIR="$v"
     fi
     export DEFAULT_VERSION DEFAULT_MEMORY DEFAULT_PORT BACKUP_RETENTION JAVA_DIR
+    # Sanitize numeric globals: a hand-edited config must not break port
+    # allocation or backup pruning.
+    if ! [[ "$BACKUP_RETENTION" =~ ^[0-9]+$ ]] || [[ "$BACKUP_RETENTION" -lt 1 ]]; then
+        BACKUP_RETENTION=7
+    fi
+    if ! [[ "$DEFAULT_PORT" =~ ^[0-9]+$ ]] || [[ "$DEFAULT_PORT" -lt 1024 || "$DEFAULT_PORT" -gt 65535 ]]; then
+        DEFAULT_PORT=25565
+    fi
+    export BACKUP_RETENTION DEFAULT_PORT
 }
 
 # Load per-server config into variables with SERVER_ prefix to avoid collisions.
@@ -148,23 +180,47 @@ load_server_config() {
 
 server_exists() {
     local name="$1"
-    [[ -d "${CRAFTCTL_DATA}/${name}" && -f "${CRAFTCTL_DATA}/${name}/config.conf" ]]
+    local d f
+    d="${CRAFTCTL_DATA}/${name}"
+    f="${d}/config.conf"
+    if [[ -d "$d" && -f "$f" ]]; then
+        return 0
+    fi
+    # Real installs keep server dirs owned by the minecraft user, which the
+    # invoking user cannot traverse directly.
+    need_root test -d "$d" 2>/dev/null && need_root test -f "$f" 2>/dev/null
 }
 
 list_servers() {
-    [[ -d "$CRAFTCTL_DATA" ]] || return 0
-    local d
-    for d in "$CRAFTCTL_DATA"/*/; do
-        [[ -d "$d" ]] || continue
-        local base
-        base="$(basename "$d")"
-        if [[ -f "${d}config.conf" ]]; then
+    local data="${CRAFTCTL_DATA}"
+    [[ -e "$data" ]] || return 0
+    local raw=""
+    if [[ -r "$data" && -x "$data" ]]; then
+        raw="$(ls -1 "$data" 2>/dev/null || true)"
+    else
+        raw="$(need_root ls -1 "$data" 2>/dev/null || true)"
+    fi
+    [[ -n "$raw" ]] || return 0
+    local base
+    while IFS= read -r base; do
+        [[ -n "$base" ]] || continue
+        if path_exists "${data}/${base}/config.conf" 2>/dev/null; then
             printf '%s\n' "$base"
         fi
-    done | sort
+    done <<< "$raw" | sort
 }
 
 # Find a free game port and rcon port, starting from defaults.
+# Probes the actual socket table when `ss` is missing (minimal images).
+_port_in_use() {
+    local port="$1"
+    if has_cmd ss; then
+        ss -ltn 2>/dev/null | grep -q ":${port} "
+    else
+        ( : </dev/tcp/127.0.0.1/"$port" ) 2>/dev/null
+    fi
+}
+
 find_free_port() {
     local start="${1:-25565}"
     local used="$2"
@@ -172,7 +228,7 @@ find_free_port() {
     local tries=0
     while [[ $tries -lt 1000 ]]; do
         if ! printf '%s\n' "$used" | grep -qx "$port"; then
-            if ! (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":${port} ") ; then
+            if ! _port_in_use "$port"; then
                 printf '%s\n' "$port"
                 return 0
             fi
@@ -184,28 +240,26 @@ find_free_port() {
 }
 
 collect_used_ports() {
-    local s f
-    [[ -d "$CRAFTCTL_DATA" ]] || return 0
-    for f in "$CRAFTCTL_DATA"/*/config.conf; do
-        [[ -f "$f" ]] || continue
-        s="$(conf_get "$f" SERVER_PORT 2>/dev/null || true)"
+    local name s
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        s="$(conf_get "${CRAFTCTL_DATA}/${name}/config.conf" SERVER_PORT 2>/dev/null || true)"
         [[ -n "$s" ]] && printf '%s\n' "$s"
-        s="$(conf_get "$f" RCON_PORT 2>/dev/null || true)"
+        s="$(conf_get "${CRAFTCTL_DATA}/${name}/config.conf" RCON_PORT 2>/dev/null || true)"
         [[ -n "$s" ]] && printf '%s\n' "$s"
-    done
+    done < <(list_servers)
 }
 
 port_in_use_by_other() {
     local port="$1" exclude="${2:-}"
-    local f s name
-    for f in "$CRAFTCTL_DATA"/*/config.conf; do
-        [[ -f "$f" ]] || continue
-        name="$(basename "$(dirname "$f")")"
+    local name s
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
         [[ "$name" == "$exclude" ]] && continue
-        s="$(conf_get "$f" SERVER_PORT 2>/dev/null || true)"
+        s="$(conf_get "${CRAFTCTL_DATA}/${name}/config.conf" SERVER_PORT 2>/dev/null || true)"
         [[ "$s" == "$port" ]] && return 0
-        s="$(conf_get "$f" RCON_PORT 2>/dev/null || true)"
+        s="$(conf_get "${CRAFTCTL_DATA}/${name}/config.conf" RCON_PORT 2>/dev/null || true)"
         [[ "$s" == "$port" ]] && return 0
-    done
+    done < <(list_servers)
     return 1
 }

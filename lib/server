@@ -78,6 +78,42 @@ server_log_path() {
     printf '%s\n' "$(server_dir "$name")/logs/latest.log"
 }
 
+# Run tar against server/backup data, acting as the minecraft user when the
+# invoking user cannot access the paths directly (preserves ownership, so no
+# later chown pass is needed for tar-created files).
+tar_data() {
+    if tar "$@" 2>/dev/null; then
+        return 0
+    fi
+    if has_cmd sudo; then
+        if sudo -u "$CRAFTCTL_MC_USER" tar "$@"; then
+            return 0
+        fi
+    fi
+    tar "$@"
+}
+
+# Newest-first full paths of a server's backup archives (sudo-aware: backup
+# dirs are minecraft-owned on real installs).
+list_backup_files() {
+    local name="$1"
+    local dir="${CRAFTCTL_BACKUP_ROOT}/${name}"
+    local raw=""
+    if [[ -r "$dir" && -x "$dir" ]]; then
+        raw="$(ls -1t "$dir" 2>/dev/null || true)"
+    else
+        raw="$(need_root ls -1t "$dir" 2>/dev/null || true)"
+    fi
+    [[ -n "$raw" ]] || return 0
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        if [[ "$f" == "${name}-"*".tar.gz" ]]; then
+            printf '%s/%s\n' "$dir" "$f"
+        fi
+    done <<< "$raw"
+}
+
 generate_rcon_password() {
     if has_cmd openssl; then
         openssl rand -hex 16
@@ -96,21 +132,19 @@ store_rcon_password() {
     local name="$1" pass="$2"
     local f
     f="$(rcon_password_file "$name")"
-    ensure_dir "$(dirname "$f")"
-    printf '%s\n' "$pass" | atomic_write "$f" 600
-    if is_root && id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
-        chown "${CRAFTCTL_MC_USER}:root" "$f" 2>/dev/null || true
-    fi
-    chmod 600 "$f"
+    need_root mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+    # Owned by the invoking admin (only craftctl ever reads it); the game
+    # server itself uses server.properties, not this file.
+    printf '%s\n' "$pass" | priv_write "$f" 600 "$(invoking_user)" || return 1
 }
 
 read_rcon_password() {
     local name="$1"
     local f
     f="$(rcon_password_file "$name")"
-    [[ -f "$f" ]] || return 1
+    path_exists "$f" 2>/dev/null || return 1
     # first line, strip whitespace/newlines
-    head -n 1 "$f" | tr -d '\r\n'
+    priv_cat "$f" 2>/dev/null | head -n 1 | tr -d '\r\n'
 }
 
 write_server_config() {
@@ -118,7 +152,8 @@ write_server_config() {
     local sport="$5" rport="$6" java_bin="$7" jvm_flags="$8"
     local conf
     conf="$(server_conf_path "$name")"
-    mkdir -p "$(dirname "$conf")" 2>/dev/null || true
+    # No secrets in here (ports/versions/paths), so keep it world-readable:
+    # routine commands (list/info) can then read it without sudo.
     {
         printf '# craftctl server configuration for %s\n' "$name"
         printf '# Managed by craftctl - edits may be overwritten by `craftctl --update-server`.\n'
@@ -131,10 +166,7 @@ write_server_config() {
         printf 'JAVA_BIN=%s\n' "$java_bin"
         printf 'JVM_FLAGS=%s\n' "$jvm_flags"
         printf 'CREATED=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    } | atomic_write "$conf" 640
-    if is_root && id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
-        chown "${CRAFTCTL_MC_USER}:root" "$conf" 2>/dev/null || true
-    fi
+    } | priv_write "$conf" 644 "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" || return 1
 }
 
 default_jvm_flags() {
@@ -143,15 +175,22 @@ default_jvm_flags() {
 }
 
 # Write or update server.properties for a server directory.
+# server.properties holds the RCON password, so it stays 640/minecraft.
 write_server_properties() {
     local dir="$1" sport="$2" rport="$3" rcon_pass="$4"
     local f="${dir}/server.properties"
-    local tmp
-    tmp="$(mktemp "${dir}/.server.properties.XXXXXX")" || return 1
-    if [[ -f "$f" ]]; then
-        cp "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
-        # Preserve existing file but enforce managed keys.
-        cp "$f" "$tmp" || { rm -f "$tmp"; return 1; }
+    local work
+    work="$(mktemp)" || return 1
+    if path_exists "$f" 2>/dev/null; then
+        # Best-effort backup of custom settings (never prompt for sudo here;
+        # the authoritative write below escalates if needed).
+        cp -f "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
+        priv_cat "$f" 2>/dev/null > "$work" || { rm -f "$work"; return 1; }
+        if [[ ! -s "$work" ]]; then
+            log_error "Cannot read '${f}' to update it."
+            rm -f "$work"
+            return 1
+        fi
         set_prop() {
             local k="$1" v="$2" file="$3"
             if grep -q "^${k}=" "$file"; then
@@ -160,18 +199,18 @@ write_server_properties() {
                 printf '%s=%s\n' "$k" "$v" >> "$file"
             fi
         }
-        set_prop "server-port" "$sport" "$tmp"
-        set_prop "enable-rcon" "true" "$tmp"
-        set_prop "rcon.port" "$rport" "$tmp"
-        set_prop "rcon.password" "$rcon_pass" "$tmp"
+        set_prop "server-port" "$sport" "$work"
+        set_prop "enable-rcon" "true" "$work"
+        set_prop "rcon.port" "$rport" "$work"
+        set_prop "rcon.password" "$rcon_pass" "$work"
         # Bind RCON to localhost only.
-        if grep -q "^rcon.ip=" "$tmp"; then
-            sed -i "s|^rcon.ip=.*|rcon.ip=127.0.0.1|" "$tmp"
+        if grep -q "^rcon.ip=" "$work"; then
+            sed -i "s|^rcon.ip=.*|rcon.ip=127.0.0.1|" "$work"
         else
-            printf 'rcon.ip=127.0.0.1\n' >> "$tmp"
+            printf 'rcon.ip=127.0.0.1\n' >> "$work"
         fi
     else
-        cat > "$tmp" <<EOF
+        cat > "$work" <<EOF
 # Minecraft server properties (managed by craftctl)
 server-port=${sport}
 enable-rcon=true
@@ -190,11 +229,12 @@ spawn-protection=16
 online-mode=true
 EOF
     fi
-    chmod 640 "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+    priv_install "$work" "$f" 640 "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" || { rm -f "$work"; return 1; }
+    rm -f "$work"
 }
 
 accept_eula() {
     local dir="$1"
-    printf '#By changing the setting below to TRUE you are indicating your agreement to our EULA (https://aka.ms/MinecraftEULA).\n#Managed by craftctl - server created %s\neula=true\n' "$(date -u +%Y-%m-%d)" | atomic_write "${dir}/eula.txt" 644
+    printf '#By changing the setting below to TRUE you are indicating your agreement to our EULA (https://aka.ms/MinecraftEULA).\n#Managed by craftctl - server created %s\neula=true\n' "$(date -u +%Y-%m-%d)" \
+        | priv_write "${dir}/eula.txt" 644 "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}"
 }

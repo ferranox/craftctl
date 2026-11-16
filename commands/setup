@@ -24,21 +24,44 @@ cmd_setup() {
     fi
 
     # Directories.
+    # Top-level containers stay root-owned and traversable so routine reads
+    # (list/info) work without sudo; per-server dirs below are minecraft-owned.
     for d in "$CRAFTCTL_ETC" "$CRAFTCTL_ETC/servers" "$CRAFTCTL_DATA" \
              "$CRAFTCTL_BACKUP_ROOT" "$CRAFTCTL_LOCK_DIR"; do
         need_root mkdir -p "$d" || return 1
     done
     # Permissions are applied via need_root (not `if is_root`): setup is
     # normally run as a sudo-capable user, not as root itself.
-    need_root chown -R "${CRAFTCTL_MC_USER}:root" "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true
     need_root chown -R "root:${CRAFTCTL_MC_USER}" "$CRAFTCTL_ETC" 2>/dev/null || true
-    need_root chmod 2750 "$CRAFTCTL_ETC" 2>/dev/null || true
-    need_root chmod 2750 "$CRAFTCTL_DATA" 2>/dev/null || true
-    need_root chmod 2750 "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true
+    need_root chmod 2750 "$CRAFTCTL_ETC" "$CRAFTCTL_ETC/servers" 2>/dev/null || true
+    need_root chown root:root "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true
+    need_root chmod 755 "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true
     # Lock dir must stay writable by invoking users (sticky bit like /tmp).
     need_root chmod 1777 "$CRAFTCTL_LOCK_DIR" 2>/dev/null || true
+    # Migrate pre-existing server/backup dirs to the current ownership model
+    # (minecraft-owned, traversable; secrets stay 640/600). Best effort.
+    local _ms _raw
+    while IFS= read -r _ms; do
+        [[ -n "$_ms" ]] || continue
+        need_root chown -R "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" "${CRAFTCTL_DATA}/${_ms}" 2>/dev/null || true
+        need_root chmod 2755 "${CRAFTCTL_DATA}/${_ms}" 2>/dev/null || true
+        need_root chmod 644 "${CRAFTCTL_DATA}/${_ms}/config.conf" 2>/dev/null || true
+        need_root chmod 640 "${CRAFTCTL_DATA}/${_ms}/server.properties" 2>/dev/null || true
+        need_root chmod 644 "${CRAFTCTL_DATA}/${_ms}/whitelist.json" "${CRAFTCTL_DATA}/${_ms}/eula.txt" 2>/dev/null || true
+    done < <(list_servers 2>/dev/null)
+    if [[ -r "$CRAFTCTL_BACKUP_ROOT" && -x "$CRAFTCTL_BACKUP_ROOT" ]]; then
+        _raw="$(ls -1 "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true)"
+    else
+        _raw="$(need_root ls -1 "$CRAFTCTL_BACKUP_ROOT" 2>/dev/null || true)"
+    fi
+    while IFS= read -r _ms; do
+        [[ -n "$_ms" ]] || continue
+        need_root chown -R "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" "${CRAFTCTL_BACKUP_ROOT}/${_ms}" 2>/dev/null || true
+        need_root chmod 2755 "${CRAFTCTL_BACKUP_ROOT}/${_ms}" 2>/dev/null || true
+    done <<< "$_raw"
+    unset _ms _raw
 
-    # Global config defaults.
+    # Global config defaults (never overwrite an existing file).
     local gconf
     gconf="$(global_conf_path)"
     if [[ ! -f "$gconf" ]]; then
@@ -53,9 +76,7 @@ cmd_setup() {
             printf 'DEFAULT_PORT=25565\n'
             printf 'BACKUP_RETENTION=7\n'
             printf 'JAVA_DIR=\n'
-        } > "${gconf}.new" || return 1
-        need_root mv "${gconf}.new" "$gconf" 2>/dev/null || mv "${gconf}.new" "$gconf" || return 1
-        need_root chmod 644 "$gconf" 2>/dev/null || chmod 644 "$gconf" || true
+        } | priv_write "$gconf" 644 "root:root" || return 1
     else
         log_info "Global configuration already exists; leaving it untouched."
     fi

@@ -117,12 +117,12 @@ _wl_list() {
     f="$(whitelist_file "$name")"
     ensure_whitelist_file "$name" || return 1
     local count
-    count="$(jq -r 'length' "$f" 2>/dev/null || printf '0')"
+    count="$(priv_cat "$f" 2>/dev/null | jq -r 'length' 2>/dev/null || printf '0')"
     if [[ "$count" == "0" ]]; then
         log_info "No whitelisted players on '${name}'."
         return 0
     fi
-    jq -r '.[].name' "$f"
+    priv_cat "$f" 2>/dev/null | jq -r '.[].name'
 }
 
 _wl_on() {
@@ -171,7 +171,7 @@ _wl_status() {
     validate_server_name "$name" || return 1
     server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
     local prop=""
-    prop="$(grep -E '^white-list=' "$(server_dir "$name")/server.properties" 2>/dev/null | cut -d= -f2 || true)"
+    prop="$(priv_cat "$(server_dir "$name")/server.properties" 2>/dev/null | grep -E '^white-list=' | cut -d= -f2 || true)"
     printf 'Server:    %s\n' "$name"
     printf 'white-list=%s (server.properties)\n' "${prop:-unknown}"
     if service_is_active "$name" 2>/dev/null; then
@@ -181,8 +181,8 @@ _wl_status() {
     fi
     local f
     f="$(whitelist_file "$name")"
-    if [[ -f "$f" ]]; then
-        printf 'Entries:   %s\n' "$(jq -r 'length' "$f" 2>/dev/null || printf '?')"
+    if path_exists "$f" 2>/dev/null; then
+        printf 'Entries:   %s\n' "$(priv_cat "$f" 2>/dev/null | jq -r 'length' 2>/dev/null || printf '?')"
     fi
 }
 
@@ -190,18 +190,15 @@ _set_whitelist_property() {
     local name="$1" value="$2"
     local f
     f="$(server_dir "$name")/server.properties"
-    [[ -f "$f" ]] || { log_error "server.properties not found."; return 1; }
+    path_exists "$f" 2>/dev/null || { log_error "server.properties not found."; return 1; }
     local tmp
     tmp="$(mktemp)" || return 1
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmp'" RETURN
-    if grep -q '^white-list=' "$f"; then
-        sed "s|^white-list=.*|white-list=${value}|" "$f" > "$tmp" || return 1
+    if priv_cat "$f" 2>/dev/null | grep -q '^white-list='; then
+        priv_cat "$f" 2>/dev/null | sed "s|^white-list=.*|white-list=${value}|" > "$tmp" || { rm -f "$tmp"; return 1; }
     else
-        cat "$f" > "$tmp" || return 1
+        priv_cat "$f" 2>/dev/null > "$tmp" || { rm -f "$tmp"; return 1; }
         printf 'white-list=%s\n' "$value" >> "$tmp"
     fi
-    cat "$tmp" > "$f" || return 1
-    trap - RETURN
+    priv_install "$tmp" "$f" 640 "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 }
