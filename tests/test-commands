@@ -1,0 +1,158 @@
+#!/usr/bin/env bats
+# craftctl tests: argument parsing, validation, lifecycle dispatch.
+# Safe: overrides all system paths, stubs systemctl.
+
+setup() {
+    export CRAFTCTL_ROOT="$BATS_TEST_DIRNAME/.."
+    export CRAFTCTL_ETC="$(mktemp -d)"
+    export CRAFTCTL_DATA="$(mktemp -d)"
+    export CRAFTCTL_BACKUP_ROOT="$(mktemp -d)"
+    export CRAFTCTL_LOCK_DIR="$(mktemp -d)"
+    export CRAFTCTL_SYSTEMD_DIR="$(mktemp -d)"
+    export CRAFTCTL_MC_USER="nobody"
+    # shellcheck disable=SC1091
+    source "${CRAFTCTL_ROOT}/api"
+    for _cf in "${CRAFTCTL_ROOT}"/commands/*; do
+        # shellcheck disable=SC1090
+        source "$_cf"
+    done
+}
+
+teardown() {
+    rm -rf "$CRAFTCTL_ETC" "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" "$CRAFTCTL_LOCK_DIR" "$CRAFTCTL_SYSTEMD_DIR"
+}
+
+@test "craftctl --help exits 0 and lists commands" {
+    run bash "${CRAFTCTL_ROOT}/craftctl" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--create"* ]]
+    [[ "$output" == *"--whitelist"* ]]
+    [[ "$output" == *"--update-server"* ]]
+}
+
+@test "craftctl --version prints version" {
+    run bash "${CRAFTCTL_ROOT}/craftctl" --version
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"craftctl "* ]]
+}
+
+@test "craftctl unknown command exits 2" {
+    run bash "${CRAFTCTL_ROOT}/craftctl" --nope
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"Unknown command"* ]]
+}
+
+@test "craftctl with no args prints help" {
+    run bash "${CRAFTCTL_ROOT}/craftctl"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage"* ]]
+}
+
+@test "validate_server_name accepts good names" {
+    validate_server_name "survival"
+    validate_server_name "creative-2"
+    validate_server_name "Test_123"
+}
+
+@test "validate_server_name rejects bad names" {
+    run validate_server_name ""
+    [ "$status" -ne 0 ]
+    run validate_server_name "../evil"
+    [ "$status" -ne 0 ]
+    run validate_server_name "a/b"
+    [ "$status" -ne 0 ]
+    run validate_server_name "has space"
+    [ "$status" -ne 0 ]
+    run validate_server_name "toolongtoolongtoolongtoolongtoolong"
+    [ "$status" -ne 0 ]
+}
+
+@test "validate_username accepts Minecraft names" {
+    validate_username "Alex"
+    validate_username "Notch"
+    validate_username "Player_123"
+}
+
+@test "validate_username rejects bad names" {
+    run validate_username "ab"
+    [ "$status" -ne 0 ]
+    run validate_username "thisnameistoolong12345"
+    [ "$status" -ne 0 ]
+    run validate_username "bad-name!"
+    [ "$status" -ne 0 ]
+}
+
+@test "validate_memory accepts valid sizes" {
+    validate_memory "2G"
+    validate_memory "4096M"
+    validate_memory "512M"
+}
+
+@test "validate_memory rejects invalid sizes" {
+    run validate_memory "2GB"
+    [ "$status" -ne 0 ]
+    run validate_memory "100M"
+    [ "$status" -ne 0 ]
+    run validate_memory "huge"
+    [ "$status" -ne 0 ]
+}
+
+@test "validate_port accepts range" {
+    validate_port "25565"
+    run validate_port "80"
+    [ "$status" -ne 0 ]
+    run validate_port "99999"
+    [ "$status" -ne 0 ]
+    run validate_port "abc"
+    [ "$status" -ne 0 ]
+}
+
+@test "validate_version accepts paper versions" {
+    validate_version "1.21.11"
+    validate_version "26.1"
+    validate_version "26.3"
+    validate_version "1.20.4"
+}
+
+@test "validate_version rejects traversal" {
+    run validate_version "../evil"
+    [ "$status" -ne 0 ]
+    run validate_version ""
+    [ "$status" -ne 0 ]
+}
+
+@test "java_required_for_mc mapping matches documented table" {
+    [ "$(java_required_for_mc 1.8)" = "8" ]
+    [ "$(java_required_for_mc 1.12)" = "11" ]
+    [ "$(java_required_for_mc 1.16.4)" = "11" ]
+    [ "$(java_required_for_mc 1.16.5)" = "16" ]
+    [ "$(java_required_for_mc 1.17)" = "17" ]
+    [ "$(java_required_for_mc 1.19.4)" = "17" ]
+    [ "$(java_required_for_mc 1.20.1)" = "21" ]
+    [ "$(java_required_for_mc 1.21.11)" = "21" ]
+    [ "$(java_required_for_mc 26.1)" = "25" ]
+    [ "$(java_required_for_mc 26.3)" = "25" ]
+}
+
+@test "cmd_status requires a name" {
+    # stub service helpers to avoid systemctl
+    service_is_active() { return 1; }
+    export -f service_is_active
+    run cmd_status
+    [ "$status" -eq 2 ]
+}
+
+@test "cmd_send requires server and command" {
+    run cmd_send
+    [ "$status" -eq 2 ]
+    run cmd_send onlyname
+    [ "$status" -eq 2 ]
+}
+
+@test "lifecycle --all with no servers succeeds" {
+    systemctl_cmd() { return 1; }
+    service_is_active() { return 1; }
+    export -f systemctl_cmd service_is_active
+    run cmd_status --all
+    [ "$status" -eq 0 ]
+}

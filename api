@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# craftctl - api
+# Shared entry point for sourcing all libraries (Pi-Apps inspired).
+# Usage: source "/opt/craftctl/api"  (or repo checkout path)
+# shellcheck shell=bash
+
+if [[ -n "${CRAFTCTL_API_LOADED:-}" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+CRAFTCTL_API_LOADED=1
+
+# Determine application directory: installed location or script-relative.
+_CRAFTCTL_API_SRC="${BASH_SOURCE[0]:-}"
+_CRAFTCTL_API_DIR="$(cd "$(dirname "$_CRAFTCTL_API_SRC")" 2>/dev/null && pwd)"
+if [[ -z "$_CRAFTCTL_API_DIR" ]]; then
+    _CRAFTCTL_API_DIR="${CRAFTCTL_ROOT:-/opt/craftctl}"
+fi
+# Allow overrides for testing.
+CRAFTCTL_ROOT="${CRAFTCTL_ROOT:-$_CRAFTCTL_API_DIR}"
+if [[ ! -d "${CRAFTCTL_ROOT}/lib" && -d "${_CRAFTCTL_API_DIR}/lib" ]]; then
+    CRAFTCTL_ROOT="$_CRAFTCTL_API_DIR"
+fi
+export CRAFTCTL_ROOT
+
+for _lib in logging common validation config dependencies java papermc server systemd rcon; do
+    _f="${CRAFTCTL_ROOT}/lib/${_lib}"
+    if [[ -f "$_f" ]]; then
+        # shellcheck disable=SC1090
+        source "$_f"
+    else
+        printf '[error] craftctl library missing: %s\n' "$_f" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+done
+unset _lib _f _CRAFTCTL_API_SRC _CRAFTCTL_API_DIR

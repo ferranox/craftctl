@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# craftctl - lib/logging
+# Terminal-aware coloured logging helpers. No output colours when not a TTY.
+# shellcheck shell=bash
+
+_craftctl_use_color() {
+    if [[ -n "${NO_COLOR:-}" ]]; then
+        return 1
+    fi
+    if [[ -n "${CRAFTCTL_NO_COLOR:-}" ]]; then
+        return 1
+    fi
+    [[ -t 1 || -t 2 ]]
+}
+
+_craftctl_color() {
+    local code="$1"
+    shift
+    if _craftctl_use_color; then
+        printf '\033[%sm%s\033[0m\n' "$code" "$*"
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+log_info() {
+    _craftctl_color "0;34" "[info] $*"
+}
+
+log_ok() {
+    _craftctl_color "0;32" "[ok] $*" >&2
+    # also print to stdout for consistency when callers capture output
+    if _craftctl_use_color; then
+        true
+    else
+        true
+    fi
+}
+
+log_warn() {
+    _craftctl_color "0;33" "[warn] $*" >&2
+}
+
+log_error() {
+    _craftctl_color "0;31" "[error] $*" >&2
+}
+
+log_success() {
+    _craftctl_color "0;32" "[ok] $*" >&2
+}
+
+die() {
+    local code="${2:-1}"
+    log_error "$1"
+    exit "$code"
+}

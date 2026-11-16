@@ -1,0 +1,124 @@
+#!/usr/bin/env bats
+# craftctl tests: config handling and multi-server isolation.
+
+setup() {
+    export CRAFTCTL_ROOT="$BATS_TEST_DIRNAME/.."
+    export CRAFTCTL_ETC="$(mktemp -d)"
+    export CRAFTCTL_DATA="$(mktemp -d)"
+    export CRAFTCTL_BACKUP_ROOT="$(mktemp -d)"
+    export CRAFTCTL_LOCK_DIR="$(mktemp -d)"
+    export CRAFTCTL_SYSTEMD_DIR="$(mktemp -d)"
+    export CRAFTCTL_MC_USER="nobody"
+    # shellcheck disable=SC1091
+    source "${CRAFTCTL_ROOT}/api"
+    for _cf in "${CRAFTCTL_ROOT}"/commands/*; do
+        # shellcheck disable=SC1090
+        source "$_cf"
+    done
+    mkdir -p "$CRAFTCTL_ETC/servers"
+}
+
+teardown() {
+    rm -rf "$CRAFTCTL_ETC" "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" "$CRAFTCTL_LOCK_DIR" "$CRAFTCTL_SYSTEMD_DIR"
+}
+
+@test "conf_set and conf_get round-trip" {
+    f="${CRAFTCTL_ETC}/t.conf"
+    conf_set "$f" FOO "bar"
+    [ "$(conf_get "$f" FOO)" = "bar" ]
+    conf_set "$f" FOO "baz"
+    [ "$(conf_get "$f" FOO)" = "baz" ]
+    conf_set "$f" OTHER "1"
+    [ "$(conf_get "$f" FOO)" = "baz" ]
+    [ "$(conf_get "$f" OTHER)" = "1" ]
+}
+
+@test "conf_set rejects bad keys and newlines" {
+    f="${CRAFTCTL_ETC}/t.conf"
+    run conf_set "$f" "bad-key" "v"
+    [ "$status" -ne 0 ]
+    run conf_set "$f" "OK" "$(printf 'a\nb')"
+    [ "$status" -ne 0 ]
+}
+
+@test "conf_set is atomic and preserves other keys" {
+    f="${CRAFTCTL_ETC}/t.conf"
+    printf 'A=1\nB=2\n' > "$f"
+    conf_set "$f" B "3"
+    [ "$(conf_get "$f" A)" = "1" ]
+    [ "$(conf_get "$f" B)" = "3" ]
+}
+
+@test "write_server_config creates valid config" {
+    write_server_config "alpha" "1.21.11" "100" "2G" "25565" "25575" "/usr/bin/java" "-Xflag"
+    [ -f "$(server_conf_path alpha)" ]
+    [ "$(conf_get "$(server_conf_path alpha)" MC_VERSION)" = "1.21.11" ]
+    [ "$(conf_get "$(server_conf_path alpha)" SERVER_PORT)" = "25565" ]
+}
+
+@test "list_servers finds configured servers only" {
+    mkdir -p "${CRAFTCTL_DATA}/one" "${CRAFTCTL_DATA}/empty"
+    printf 'SERVER_NAME=one\n' > "${CRAFTCTL_DATA}/one/config.conf"
+    result="$(list_servers)"
+    [[ "$result" == *"one"* ]]
+    [[ "$result" != *"empty"* ]]
+}
+
+@test "port_in_use_by_other detects collisions" {
+    mkdir -p "${CRAFTCTL_DATA}/a"
+    printf 'SERVER_PORT=25565\nRCON_PORT=25575\n' > "${CRAFTCTL_DATA}/a/config.conf"
+    run port_in_use_by_other "25565" "b"
+    [ "$status" -eq 0 ]
+    run port_in_use_by_other "25566" "b"
+    [ "$status" -ne 0 ]
+    # same server excluded
+    run port_in_use_by_other "25565" "a"
+    [ "$status" -ne 0 ]
+}
+
+@test "find_free_port skips used ports" {
+    used="$(printf '25565\n25566')"
+    [ "$(find_free_port 25565 "$used")" = "25567" ]
+}
+
+@test "server.properties writer enforces rcon binding" {
+    d="$(mktemp -d)"
+    write_server_properties "$d" "25565" "25575" "secret123"
+    grep -q "^server-port=25565$" "$d/server.properties"
+    grep -q "^enable-rcon=true$" "$d/server.properties"
+    grep -q "^rcon.ip=127.0.0.1$" "$d/server.properties"
+    # second run preserves custom keys and updates managed ones
+    printf 'motd=hello\n' >> "$d/server.properties"
+    write_server_properties "$d" "25566" "25576" "secret456"
+    grep -q "^server-port=25566$" "$d/server.properties"
+    grep -q "^motd=hello$" "$d/server.properties"
+    rm -rf "$d"
+}
+
+@test "accept_eula writes eula=true" {
+    d="$(mktemp -d)"
+    accept_eula "$d"
+    grep -q "^eula=true$" "$d/eula.txt"
+    rm -rf "$d"
+}
+
+@test "rcon passwords are unique and stored with 600" {
+    p1="$(generate_rcon_password)"
+    p2="$(generate_rcon_password)"
+    [ -n "$p1" ]
+    [ -n "$p2" ]
+    [ "$p1" != "$p2" ]
+    store_rcon_password "srv1" "$p1"
+    [ "$(read_rcon_password srv1)" = "$p1" ]
+    [ "$(stat -c %a "${CRAFTCTL_ETC}/servers/srv1.rcon")" = "600" ]
+}
+
+@test "multi-server isolation: dirs and ports independent" {
+    write_server_config "s1" "1.21.11" "1" "2G" "25565" "25575" "/j21" "flags"
+    write_server_config "s2" "1.20.4" "2" "4G" "25566" "25576" "/j17" "flags"
+    [ "$(server_dir s1)" != "$(server_dir s2)" ]
+    [ "$(conf_get "$(server_conf_path s1)" JAVA_BIN)" = "/j21" ]
+    [ "$(conf_get "$(server_conf_path s2)" JAVA_BIN)" = "/j17" ]
+    run port_in_use_by_other "25565" "s2"
+    [ "$status" -eq 0 ]
+}

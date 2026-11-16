@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# craftctl command: whitelist
+# Usage: craftctl --whitelist <add|remove|list|on|off|status> <server> [player]
+# shellcheck shell=bash
+
+cmd_whitelist() {
+    local action="${1:-}"
+    case "$action" in
+        add|remove|list|on|off|status|"") ;;
+        --help|-h|help) _whitelist_help; return 0 ;;
+        *) log_error "Unknown whitelist action '${action}'."; _whitelist_help; return 2 ;;
+    esac
+    if [[ -z "$action" ]]; then
+        log_error "Usage: craftctl --whitelist <add|remove|list|on|off|status> <server> [player]"
+        return 2
+    fi
+    shift || true
+    case "$action" in
+        add) _wl_add "$@" ;;
+        remove) _wl_remove "$@" ;;
+        list) _wl_list "$@" ;;
+        on) _wl_on "$@" ;;
+        off) _wl_off "$@" ;;
+        status) _wl_status "$@" ;;
+    esac
+}
+
+_whitelist_help() {
+    cat <<'EOF'
+Usage: craftctl --whitelist <action> <server> [player]
+
+  add <server> <player>       Whitelist a player
+  remove <server> <player>    Remove a player from the whitelist
+  list <server>               List whitelisted players
+  on <server>                 Enable the whitelist
+  off <server>                Disable the whitelist
+  status <server>             Show whitelist status
+EOF
+}
+
+_wl_add() {
+    local name="${1:-}" user="${2:-}"
+    [[ -n "$name" && -n "$user" ]] || { log_error "Usage: craftctl --whitelist add <server> <player>"; return 2; }
+    validate_server_name "$name" || return 1
+    validate_username "$user" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    if service_is_active "$name" 2>/dev/null; then
+        local out
+        if out="$(rcon_send "$name" "whitelist add ${user}" 2>&1)"; then
+            if printf '%s' "$out" | grep -qiE 'added|already'; then
+                log_ok "Player '${user}' whitelisted on '${name}'."
+                printf '%s\n' "$out"
+                return 0
+            fi
+            # RCON succeeded but unexpected output: still report output, treat as success
+            # only if the server acknowledged. Otherwise fall back to error.
+            log_warn "Unexpected response from server: ${out}"
+            return 1
+        else
+            log_error "Could not add '${user}': server did not confirm (is RCON configured?)."
+            [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+            return 1
+        fi
+    else
+        # Offline: edit whitelist.json directly.
+        local uuid=""
+        uuid="$(mojang_uuid_for "$user" 2>/dev/null || true)"
+        if offline_whitelist_add "$name" "$user" "$uuid"; then
+            log_ok "Player '${user}' whitelisted on '${name}' (server offline; applied to whitelist.json)."
+            return 0
+        fi
+        return 1
+    fi
+}
+
+_wl_remove() {
+    local name="${1:-}" user="${2:-}"
+    [[ -n "$name" && -n "$user" ]] || { log_error "Usage: craftctl --whitelist remove <server> <player>"; return 2; }
+    validate_server_name "$name" || return 1
+    validate_username "$user" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    if service_is_active "$name" 2>/dev/null; then
+        local out
+        if out="$(rcon_send "$name" "whitelist remove ${user}" 2>&1)"; then
+            log_ok "Player '${user}' removed from whitelist on '${name}'."
+            printf '%s\n' "$out"
+            return 0
+        else
+            log_error "Could not remove '${user}'."
+            [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+            return 1
+        fi
+    else
+        if offline_whitelist_remove "$name" "$user"; then
+            log_ok "Player '${user}' removed from whitelist on '${name}' (server offline)."
+            return 0
+        fi
+        return 1
+    fi
+}
+
+_wl_list() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || { log_error "Usage: craftctl --whitelist list <server>"; return 2; }
+    validate_server_name "$name" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    if service_is_active "$name" 2>/dev/null; then
+        local out
+        if out="$(rcon_send "$name" "whitelist list" 2>&1)"; then
+            printf '%s\n' "$out"
+            return 0
+        else
+            log_warn "RCON query failed; falling back to whitelist.json."
+        fi
+    fi
+    local f
+    f="$(whitelist_file "$name")"
+    ensure_whitelist_file "$name" || return 1
+    local count
+    count="$(jq -r 'length' "$f" 2>/dev/null || printf '0')"
+    if [[ "$count" == "0" ]]; then
+        log_info "No whitelisted players on '${name}'."
+        return 0
+    fi
+    jq -r '.[].name' "$f"
+}
+
+_wl_on() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || { log_error "Usage: craftctl --whitelist on <server>"; return 2; }
+    validate_server_name "$name" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    if service_is_active "$name" 2>/dev/null; then
+        local out
+        if out="$(rcon_send "$name" "whitelist on" 2>&1)"; then
+            log_ok "Whitelist enabled on '${name}'."
+            printf '%s\n' "$out"
+        else
+            log_error "Could not enable whitelist via RCON."
+            return 1
+        fi
+    else
+        _set_whitelist_property "$name" "true" || return 1
+        log_ok "Whitelist will be enabled on '${name}' at next startup (server offline)."
+    fi
+}
+
+_wl_off() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || { log_error "Usage: craftctl --whitelist off <server>"; return 2; }
+    validate_server_name "$name" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    if service_is_active "$name" 2>/dev/null; then
+        local out
+        if out="$(rcon_send "$name" "whitelist off" 2>&1)"; then
+            log_ok "Whitelist disabled on '${name}'."
+            printf '%s\n' "$out"
+        else
+            log_error "Could not disable whitelist via RCON."
+            return 1
+        fi
+    else
+        _set_whitelist_property "$name" "false" || return 1
+        log_ok "Whitelist will be disabled on '${name}' at next startup (server offline)."
+    fi
+}
+
+_wl_status() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || { log_error "Usage: craftctl --whitelist status <server>"; return 2; }
+    validate_server_name "$name" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    local prop=""
+    prop="$(grep -E '^white-list=' "$(server_dir "$name")/server.properties" 2>/dev/null | cut -d= -f2 || true)"
+    printf 'Server:    %s\n' "$name"
+    printf 'white-list=%s (server.properties)\n' "${prop:-unknown}"
+    if service_is_active "$name" 2>/dev/null; then
+        printf 'State:     online\n'
+    else
+        printf 'State:     offline\n'
+    fi
+    local f
+    f="$(whitelist_file "$name")"
+    if [[ -f "$f" ]]; then
+        printf 'Entries:   %s\n' "$(jq -r 'length' "$f" 2>/dev/null || printf '?')"
+    fi
+}
+
+_set_whitelist_property() {
+    local name="$1" value="$2"
+    local f
+    f="$(server_dir "$name")/server.properties"
+    [[ -f "$f" ]] || { log_error "server.properties not found."; return 1; }
+    local tmp
+    tmp="$(mktemp)" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp'" RETURN
+    if grep -q '^white-list=' "$f"; then
+        sed "s|^white-list=.*|white-list=${value}|" "$f" > "$tmp" || return 1
+    else
+        cat "$f" > "$tmp" || return 1
+        printf 'white-list=%s\n' "$value" >> "$tmp"
+    fi
+    cat "$tmp" > "$f" || return 1
+    trap - RETURN
+    rm -f "$tmp"
+}

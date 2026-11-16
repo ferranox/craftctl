@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# craftctl command: list (also: --versions)
+# shellcheck shell=bash
+
+cmd_list() {
+    local servers
+    servers="$(list_servers)"
+    if [[ -z "$servers" ]]; then
+        log_info "No servers configured. Create one with: craftctl --create <name>"
+        return 0
+    fi
+    printf '%-16s %-12s %-8s %-8s %s\n' "NAME" "VERSION" "MEMORY" "PORT" "STATUS"
+    local s
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        local conf ver mem port status="stopped"
+        conf="$(server_conf_path "$s")"
+        ver="$(conf_get "$conf" MC_VERSION 2>/dev/null || printf '?')"
+        mem="$(conf_get "$conf" MEMORY 2>/dev/null || printf '?')"
+        port="$(conf_get "$conf" SERVER_PORT 2>/dev/null || printf '?')"
+        if service_is_active "$s" 2>/dev/null; then
+            status="running"
+        fi
+        printf '%-16s %-12s %-8s %-8s %s\n' "$s" "$ver" "$mem" "$port" "$status"
+    done <<< "$servers"
+}
+
+cmd_versions() {
+    local only=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --minecraft) only="${2:-}"; shift 2 ;;
+            --minecraft=*) only="${1#--minecraft=}"; shift ;;
+            --help|-h) printf 'Usage: craftctl --versions [--minecraft VER]\n'; return 0 ;;
+            *) log_error "Unknown option for --versions: $1"; return 2 ;;
+        esac
+    done
+    log_info "Fetching available PaperMC versions..."
+    local vers
+    vers="$(papermc_list_versions)" || return 1
+    if [[ -n "$only" ]]; then
+        printf '%s\n' "$vers" | grep -x "$only" || { log_error "Version '${only}' not available."; return 1; }
+        return 0
+    fi
+    printf '%s\n' "$vers"
+}

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# craftctl - lib/papermc
+# PaperMC Fill API (v3) integration.
+# Docs: https://fill.papermc.io/api-docs and https://docs.papermc.io/misc/downloads-service/
+# shellcheck shell=bash
+
+fill_curl() {
+    local url="$1"
+    local out="$2"
+    local ua="craftctl/${CRAFTCTL_VERSION} (https://github.com/ferranox/craftctl)"
+    curl -fsSL --connect-timeout 15 --max-time 60 \
+        -H "User-Agent: ${ua}" \
+        -o "$out" "$url"
+}
+
+fill_get_json() {
+    local url="$1"
+    local tmp
+    tmp="$(mktemp)" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp'" RETURN
+    if ! fill_curl "$url" "$tmp"; then
+        log_error "PaperMC API request failed: ${url}"
+        log_error "Check network connectivity and Fill API status."
+        return 1
+    fi
+    if ! jq empty "$tmp" 2>/dev/null; then
+        log_error "PaperMC API returned invalid JSON."
+        return 1
+    fi
+    # Detect API error envelope {"ok":false,...}
+    if jq -e 'has("ok") and .ok == false' "$tmp" >/dev/null 2>&1; then
+        local msg
+        msg="$(jq -r '.message // .error // "unknown error"' "$tmp")"
+        log_error "PaperMC API error: ${msg}"
+        return 1
+    fi
+    cat "$tmp"
+}
+
+# List all available Paper versions (stable releases only, no -rc/-pre/-SNAPSHOT).
+papermc_list_versions() {
+    local json
+    json="$(fill_get_json "${FILL_API_BASE}/projects/${PAPER_PROJECT}")" || return 1
+    printf '%s\n' "$json" | jq -r '.versions | to_entries[] | .value[]' \
+        | grep -v -- '-' | sort -V -u
+}
+
+# Latest stable Paper version (first non-prerelease when families ordered newest-first).
+papermc_latest_version() {
+    # Families in the /projects response are ordered newest-first; keep that order,
+    # do not sort, so we return the newest release rather than the highest sort key.
+    local json
+    json="$(fill_get_json "${FILL_API_BASE}/projects/${PAPER_PROJECT}")" || return 1
+    printf '%s\n' "$json" | jq -r '
+        .versions | to_entries[] | .value[]' \
+        | grep -v -- '-' | head -n 1
+}
+
+papermc_version_exists() {
+    local ver="$1"
+    local json
+    json="$(fill_get_json "${FILL_API_BASE}/projects/${PAPER_PROJECT}")" || return 1
+    if printf '%s\n' "$json" | jq -e --arg v "$ver" '.versions | to_entries[] | .value[] | select(. == $v)' >/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+papermc_version_metadata() {
+    local ver="$1"
+    fill_get_json "${FILL_API_BASE}/projects/${PAPER_PROJECT}/versions/${ver}"
+}
+
+# Latest STABLE build number for a version. Falls back to any channel with warning.
+papermc_latest_stable_build() {
+    local ver="$1"
+    local json
+    json="$(fill_get_json "${FILL_API_BASE}/projects/${PAPER_PROJECT}/versions/${ver}/builds?channel=STABLE")" || return 1
+    local id
+    # Builds endpoint returns a JSON array, newest first.
+    id="$(printf '%s\n' "$json" | jq -r 'if type == "array" then (.[0] | .id // empty) else (.id // empty) end' 2>/dev/null)"
+    if [[ -n "$id" && "$id" != "null" ]]; then
+        printf '%s\n' "$id"
+        return 0
+    fi
+    # Fallback: newest build of any channel (warn that it may not be stable).
+    json="$(fill_get_json "${FILL_API_BASE}/projects/${PAPER_PROJECT}/versions/${ver}/builds")" || return 1
+    id="$(printf '%s\n' "$json" | jq -r 'if type == "array" then (.[0] | .id // empty) else empty end')"
+    if [[ -n "$id" && "$id" != "null" ]]; then
+        log_warn "No STABLE build for Paper ${ver}; using latest build ${id} (channel may be BETA/ALPHA)."
+        printf '%s\n' "$id"
+        return 0
+    fi
+    log_error "No PaperMC builds found for version '${ver}'."
+    return 1
+}
+
+# Print "<url> <sha256> <size> <name>" for a given version+build.
+papermc_build_info() {
+    local ver="$1" build="$2"
+    local json
+    json="$(fill_get_json "${FILL_API_BASE}/projects/${PAPER_PROJECT}/versions/${ver}/builds/${build}")" || return 1
+    local url sha size name
+    url="$(printf '%s\n' "$json" | jq -r '.downloads."server:default".url // empty')"
+    sha="$(printf '%s\n' "$json" | jq -r '.downloads."server:default".checksums.sha256 // empty')"
+    size="$(printf '%s\n' "$json" | jq -r '.downloads."server:default".size // empty')"
+    name="$(printf '%s\n' "$json" | jq -r '.downloads."server:default".name // empty')"
+    if [[ -z "$url" || "$url" == "null" ]]; then
+        log_error "No server download available for Paper ${ver} build ${build}."
+        return 1
+    fi
+    printf '%s %s %s %s\n' "$url" "$sha" "$size" "$name"
+}
+
+papermc_download_jar() {
+    local ver="$1" build="$2" dest="$3"
+    local info url sha
+    info="$(papermc_build_info "$ver" "$build")" || return 1
+    url="$(printf '%s' "$info" | awk '{print $1}')"
+    sha="$(printf '%s' "$info" | awk '{print $2}')"
+    local tmp="${dest}.download.$$"
+    local ua="craftctl/${CRAFTCTL_VERSION} (https://github.com/ferranox/craftctl)"
+    log_info "Downloading PaperMC ${ver} build ${build}..."
+    if ! curl -fL --connect-timeout 15 --max-time 600 -H "User-Agent: ${ua}" -o "$tmp" "$url"; then
+        rm -f "$tmp"
+        log_error "Download failed for Paper ${ver} build ${build}."
+        return 1
+    fi
+    if [[ -n "$sha" && "$sha" != "null" && "$sha" != "empty" ]]; then
+        local actual
+        actual="$(sha256sum "$tmp" | awk '{print $1}')"
+        if [[ "$actual" != "$sha" ]]; then
+            rm -f "$tmp"
+            log_error "Checksum mismatch for Paper ${ver} build ${build}."
+            log_error "Expected ${sha}, got ${actual}."
+            return 1
+        fi
+        log_info "Checksum verified (sha256)."
+    else
+        log_warn "No checksum published for this build; skipping verification."
+    fi
+    mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
+    log_ok "Downloaded PaperMC ${ver} build ${build}."
+}

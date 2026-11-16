@@ -1,0 +1,150 @@
+#!/usr/bin/env bats
+# craftctl tests: installer behaviour, papermc parsing, backup/restore, errors.
+# All network/system interactions are stubbed.
+
+setup() {
+    export CRAFTCTL_ROOT="$BATS_TEST_DIRNAME/.."
+    export CRAFTCTL_ETC="$(mktemp -d)"
+    export CRAFTCTL_DATA="$(mktemp -d)"
+    export CRAFTCTL_BACKUP_ROOT="$(mktemp -d)"
+    export CRAFTCTL_LOCK_DIR="$(mktemp -d)"
+    export CRAFTCTL_SYSTEMD_DIR="$(mktemp -d)"
+    export CRAFTCTL_MC_USER="nobody"
+    # shellcheck disable=SC1091
+    source "${CRAFTCTL_ROOT}/api"
+    for _cf in "${CRAFTCTL_ROOT}"/commands/*; do
+        # shellcheck disable=SC1090
+        source "$_cf"
+    done
+    mkdir -p "$CRAFTCTL_ETC/servers"
+}
+
+teardown() {
+    rm -rf "$CRAFTCTL_ETC" "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" "$CRAFTCTL_LOCK_DIR" "$CRAFTCTL_SYSTEMD_DIR"
+}
+
+@test "install script is pipe-safe (no \$0/CWD dependence)" {
+    # The installer must not use $0 or pwd-dependent repo discovery.
+    run grep -E '\$0|__file__|BASH_SOURCE.*install' "${CRAFTCTL_ROOT}/install"
+    # grep exits 1 when nothing found -> run status 1 means clean.
+    [ "$status" -eq 1 ]
+}
+
+@test "install script checks for non-root and sudo" {
+    grep -q 'Do not run the installer as root' "${CRAFTCTL_ROOT}/install"
+    grep -q "command -v sudo" "${CRAFTCTL_ROOT}/install"
+}
+
+@test "install script verifies systemd" {
+    grep -q "/run/systemd/system" "${CRAFTCTL_ROOT}/install"
+}
+
+@test "install script uses temp staging dir" {
+    grep -q "mktemp -d" "${CRAFTCTL_ROOT}/install"
+}
+
+@test "uninstall keeps data by default, purges only with flag" {
+    grep -q -- "--purge" "${CRAFTCTL_ROOT}/uninstall"
+    # default path must not rm data dirs unconditionally
+    run bash -c 'grep -E "^need_root rm -rf \"\$DATA_ROOT\"" "${CRAFTCTL_ROOT}/uninstall"'
+    [ "$status" -eq 1 ]
+}
+
+@test "papermc versions parsing filters pre-releases" {
+    # Stub the API response.
+    fill_get_json() {
+        cat <<'EOF'
+{"project":{"id":"paper","name":"Paper"},"versions":{"26.3":["26.3","26.3-rc-3"],"1.21":["1.21.11","1.21.11-rc3","1.21.10"]}}
+EOF
+    }
+    export -f fill_get_json
+    run papermc_list_versions
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"1.21.11"* ]]
+    [[ "$output" != *"rc"* ]]
+}
+
+@test "papermc latest version prefers family order (no sort)" {
+    fill_get_json() {
+        cat <<'EOF'
+{"project":{"id":"paper","name":"Paper"},"versions":{"26.3":["26.3"],"1.21":["1.21.11"]}}
+EOF
+    }
+    export -f fill_get_json
+    [ "$(papermc_latest_version)" = "26.3" ]
+}
+
+@test "papermc build info extracts url and sha256" {
+    fill_get_json() {
+        cat <<'EOF'
+{"id":189,"channel":"STABLE","downloads":{"server:default":{"name":"paper-26.3-189.jar","checksums":{"sha256":"abc123"},"size":100,"url":"https://example/paper.jar"}}}
+EOF
+    }
+    export -f fill_get_json
+    out="$(papermc_build_info 26.3 189)"
+    [[ "$out" == *"https://example/paper.jar"* ]]
+    [[ "$out" == *"abc123"* ]]
+}
+
+@test "papermc latest stable build picks first STABLE" {
+    fill_get_json() {
+        cat <<'EOF'
+[{"id":200,"channel":"STABLE"},{"id":199,"channel":"STABLE"}]
+EOF
+    }
+    export -f fill_get_json
+    [ "$(papermc_latest_stable_build 26.3)" = "200" ]
+}
+
+@test "backup creates verifiable archive and prunes" {
+    srv="bkpsrv"
+    mkdir -p "$(server_dir "$srv")"
+    printf 'hello world\n' > "$(server_dir "$srv")/server.properties"
+    mkdir -p "$(server_dir "$srv")/world"
+    printf 'level\n' > "$(server_dir "$srv")/world/level.dat"
+    service_is_active() { return 1; }
+    need_root() { "$@"; }
+    export -f service_is_active need_root
+    run _do_backup "$srv" 2
+    [ "$status" -eq 0 ]
+    count="$(ls "${CRAFTCTL_BACKUP_ROOT}/${srv}"/*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
+    [ "$count" -eq 1 ]
+    # second + third backups with keep=2 prunes oldest
+    sleep 1
+    _do_backup "$srv" 2
+    sleep 1
+    _do_backup "$srv" 2
+    count="$(ls "${CRAFTCTL_BACKUP_ROOT}/${srv}"/*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
+    [ "$count" -eq 2 ]
+}
+
+@test "restore refuses corrupt archives" {
+    srv="rstsrv"
+    mkdir -p "$(server_dir "$srv")"
+    printf 'SERVER_NAME=%s\n' "$srv" > "$(server_conf_path "$srv")"
+    printf 'not a tarball' > "${CRAFTCTL_BACKUP_ROOT}/bad.tar.gz"
+    service_is_active() { return 1; }
+    export -f service_is_active
+    run _do_restore "$srv" "${CRAFTCTL_BACKUP_ROOT}/bad.tar.gz"
+    [ "$status" -ne 0 ]
+}
+
+@test "with_server_lock prevents concurrent runs" {
+    if ! command -v flock >/dev/null 2>&1; then
+        skip "flock not available"
+    fi
+    srv="locksrv"
+    mkdir -p "$(server_dir "$srv")"
+    printf 'SERVER_NAME=%s\n' "$srv" > "$(server_conf_path "$srv")"
+    (
+        exec 8>"$(server_lock_file "$srv")"
+        flock -n 8 || exit 0
+        sleep 2
+    ) &
+    bgpid=$!
+    sleep 0.5
+    run with_server_lock "$srv" true
+    [ "$status" -ne 0 ]
+    kill $bgpid 2>/dev/null || true
+    wait $bgpid 2>/dev/null || true
+}

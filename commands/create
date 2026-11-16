@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# craftctl command: create
+# shellcheck shell=bash
+
+cmd_create() {
+    local name="" mc_version="" memory="" port="" rcon_port=""
+    # Parse: first positional is name, rest are flags.
+    if [[ $# -ge 1 && "$1" != -* ]]; then
+        name="$1"
+        shift
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) mc_version="${2:-}"; shift 2 ;;
+            --version=*) mc_version="${1#--version=}"; shift ;;
+            --memory) memory="${2:-}"; shift 2 ;;
+            --memory=*) memory="${1#--memory=}"; shift ;;
+            --port) port="${2:-}"; shift 2 ;;
+            --port=*) port="${1#--port=}"; shift ;;
+            --rcon-port) rcon_port="${2:-}"; shift 2 ;;
+            --rcon-port=*) rcon_port="${1#--rcon-port=}"; shift ;;
+            --help|-h) _create_help; return 0 ;;
+            *) log_error "Unknown option for --create: $1"; _create_help; return 2 ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        if [[ -t 0 ]]; then
+            name="$(prompt_default "Server name" "")"
+        fi
+        if [[ -z "$name" ]]; then
+            log_error "Usage: craftctl --create <name> [--version VER] [--memory MEM] [--port PORT]"
+            return 2
+        fi
+    fi
+    validate_server_name "$name" || return 1
+    if server_exists "$name"; then
+        log_error "Server '${name}' already exists."
+        return 1
+    fi
+
+    load_global_config
+    # Defaults.
+    if [[ -z "$mc_version" ]]; then
+        if [[ -n "${DEFAULT_VERSION:-}" ]]; then
+            mc_version="$DEFAULT_VERSION"
+        else
+            log_info "Detecting latest stable PaperMC version..."
+            mc_version="$(papermc_latest_version)" || return 1
+        fi
+    fi
+    validate_version "$mc_version" || return 1
+
+    # Verify version exists in Fill API (never silently substitute).
+    if ! papermc_version_exists "$mc_version"; then
+        log_error "PaperMC version '${mc_version}' does not exist."
+        log_error "Run 'craftctl --versions' to list available versions."
+        return 1
+    fi
+    # Warn if only pre-release / unsupported? Check support status.
+    local meta min_java
+    meta="$(papermc_version_metadata "$mc_version" 2>/dev/null || true)"
+    if [[ -n "$meta" ]]; then
+        local support
+        support="$(printf '%s' "$meta" | jq -r '.version.support.status // empty' 2>/dev/null)"
+        if [[ "$support" == "UNSUPPORTED" ]]; then
+            log_warn "PaperMC marks version ${mc_version} as UNSUPPORTED (no further builds)."
+        fi
+        min_java="$(printf '%s' "$meta" | jq -r '.version.java.version.minimum // empty' 2>/dev/null)"
+    fi
+
+    if [[ -z "$memory" ]]; then
+        memory="${DEFAULT_MEMORY:-2G}"
+        if [[ -t 0 ]]; then
+            memory="$(prompt_default "Memory allocation (e.g. 2G)" "$memory")"
+        fi
+    fi
+    validate_memory "$memory" || return 1
+
+    # Ports: unique across servers.
+    local used
+    used="$(collect_used_ports)"
+    if [[ -z "$port" ]]; then
+        port="$(find_free_port "${DEFAULT_PORT:-25565}" "$used")" || { log_error "No free server port found."; return 1; }
+        if [[ -t 0 ]]; then
+            port="$(prompt_default "Server port" "$port")"
+        fi
+    fi
+    validate_port "$port" || return 1
+    if port_in_use_by_other "$port" ""; then
+        log_error "Port ${port} is already used by another server."
+        return 1
+    fi
+    if [[ -z "$rcon_port" ]]; then
+        # RCON default: server port + 10? Use 25575 base and scan.
+        rcon_port="$(find_free_port 25575 "$(printf '%s\n%s\n' "$used" "$port")")" || { log_error "No free RCON port found."; return 1; }
+    fi
+    validate_port "$rcon_port" || return 1
+    if [[ "$rcon_port" == "$port" ]]; then
+        log_error "RCON port must differ from server port."
+        return 1
+    fi
+    if port_in_use_by_other "$rcon_port" ""; then
+        log_error "Port ${rcon_port} is already used by another server."
+        return 1
+    fi
+
+    # Java selection.
+    local java_major java_bin
+    java_major="$(java_required_for_mc "$mc_version")" || return 1
+    if [[ -n "${min_java:-}" && "$min_java" != "null" && "$min_java" != "$java_major" ]]; then
+        # Trust the Fill API minimum when it disagrees (docs may lag).
+        log_warn "Fill API reports minimum Java ${min_java} for Paper ${mc_version} (table says ${java_major}); using ${min_java}."
+        java_major="$min_java"
+    fi
+    log_info "Paper ${mc_version} requires Java ${java_major}."
+    java_bin="$(ensure_java_for_version "$mc_version" 2>/dev/null || find_java_for_major "$java_major" 2>/dev/null || true)"
+    if [[ -z "$java_bin" ]]; then
+        log_info "Installing Java ${java_major}..."
+        java_bin="$(install_java_for_major "$java_major")" || return 1
+    fi
+    log_info "Using Java: ${java_bin}"
+
+    # Latest stable build.
+    local build
+    log_info "Resolving latest STABLE PaperMC build for ${mc_version}..."
+    build="$(papermc_latest_stable_build "$mc_version")" || return 1
+    log_info "Selected PaperMC ${mc_version} build ${build}."
+
+    # Lock around creation.
+    _create_locked "$name" "$mc_version" "$build" "$memory" "$port" "$rcon_port" "$java_bin"
+}
+
+_create_locked() {
+    local name="$1" mc_version="$2" build="$3" memory="$4" port="$5" rport="$6" java_bin="$7"
+    ensure_dir "$CRAFTCTL_LOCK_DIR" 2>/dev/null || true
+    local lock
+    lock="$(server_lock_file "$name")"
+    ensure_dir "$(dirname "$lock")" 2>/dev/null || true
+    exec 9>"$lock" 2>/dev/null || true
+    if has_cmd flock && ! flock -n 9 2>/dev/null; then
+        log_error "Another operation is already running for server '${name}'."
+        exec 9>&- 2>/dev/null || true
+        return 1
+    fi
+    _do_create "$name" "$mc_version" "$build" "$memory" "$port" "$rport" "$java_bin"
+    local rc=$?
+    exec 9>&- 2>/dev/null || true
+    return $rc
+}
+
+_do_create() {
+    local name="$1" mc_version="$2" build="$3" memory="$4" port="$5" rport="$6" java_bin="$7"
+    local dir
+    dir="$(server_dir "$name")"
+    local rcon_pass
+    rcon_pass="$(generate_rcon_password)"
+
+    log_info "Creating server '${name}' in ${dir}..."
+    need_root mkdir -p "$dir" "$dir/logs" "${CRAFTCTL_BACKUP_ROOT}/${name}" "${CRAFTCTL_ETC}/servers" || return 1
+
+    # Download server JAR (as minecraft user when possible).
+    local jar="${dir}/server.jar"
+    local tmpjar
+    tmpjar="$(mktemp_dir)/server.jar" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$(dirname "$tmpjar")'" RETURN
+    papermc_download_jar "$mc_version" "$build" "$tmpjar" || return 1
+    need_root cp "$tmpjar" "$jar" || cp "$tmpjar" "$jar" || return 1
+    rm -rf "$(dirname "$tmpjar")"
+    trap - RETURN
+
+    store_rcon_password "$name" "$rcon_pass" || return 1
+    local flags
+    flags="$(default_jvm_flags)"
+    write_server_config "$name" "$mc_version" "$build" "$memory" "$port" "$rport" "$java_bin" "$flags" || return 1
+    # server.properties + eula need to be owned by minecraft.
+    write_server_properties "$dir" "$port" "$rport" "$rcon_pass" || return 1
+    accept_eula "$dir" || return 1
+    printf '[]\n' > "${dir}/whitelist.json" 2>/dev/null || true
+
+    if is_root; then
+        chown -R "${CRAFTCTL_MC_USER}:${CRAFTCTL_MC_USER}" "$dir" 2>/dev/null || chown -R "${CRAFTCTL_MC_USER}" "$dir" 2>/dev/null || true
+        chown -R "${CRAFTCTL_MC_USER}:root" "${CRAFTCTL_BACKUP_ROOT}/${name}" 2>/dev/null || true
+        chmod 2750 "$dir" 2>/dev/null || true
+    fi
+
+    # Reload systemd so the template instance can start (template is generic,
+    # but a daemon-reload is harmless and keeps status output accurate).
+    need_root systemctl daemon-reload 2>/dev/null || true
+
+    log_ok "Server '${name}' created: PaperMC ${mc_version} (build ${build}), memory ${memory}, port ${port}."
+    log_info "Start it with: craftctl --start ${name}"
+}
+
+_create_help() {
+    cat <<'EOF'
+Usage: craftctl --create <name> [options]
+
+Options:
+  --version VER     Minecraft version (default: latest stable PaperMC)
+  --memory MEM      Heap size, e.g. 2G (default: 2G)
+  --port PORT       Server port (default: next free from 25565)
+  --rcon-port PORT  RCON port on 127.0.0.1 (default: next free from 25575)
+EOF
+}

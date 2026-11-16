@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# craftctl - lightweight Minecraft server manager for headless Linux.
+# https://github.com/ferranox/craftctl
+set -uo pipefail
+
+CRAFTCTL_VERSION="1.0.0"
+
+# Locate application root.
+_SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+if [[ "$_SCRIPT_PATH" != /* ]]; then
+    _SCRIPT_PATH="$(command -v craftctl 2>/dev/null || printf '%s' "$_SCRIPT_PATH")"
+fi
+_APP_DIR="$(cd "$(dirname "$_SCRIPT_PATH")" 2>/dev/null && pwd)"
+# Installed layout: /usr/local/bin/craftctl -> libs in /opt/craftctl
+if [[ -d "/opt/craftctl/lib" ]]; then
+    APP_ROOT="/opt/craftctl"
+elif [[ -d "${_APP_DIR}/lib" ]]; then
+    APP_ROOT="$_APP_DIR"
+elif [[ -d "${_APP_DIR}/../lib" ]]; then
+    APP_ROOT="$(cd "${_APP_DIR}/.." && pwd)"
+else
+    APP_ROOT="${CRAFTCTL_ROOT:-/opt/craftctl}"
+fi
+export CRAFTCTL_ROOT="$APP_ROOT"
+export CRAFTCTL_APP_DIR="$APP_ROOT"
+
+# shellcheck disable=SC1091
+if [[ -f "${APP_ROOT}/api" ]]; then
+    source "${APP_ROOT}/api"
+else
+    echo "[error] craftctl installation is incomplete: ${APP_ROOT}/api not found." >&2
+    exit 1
+fi
+
+COMMANDS_DIR="${APP_ROOT}/commands"
+for _c in "$COMMANDS_DIR"/*; do
+    [[ -f "$_c" ]] || continue
+    # shellcheck disable=SC1090
+    source "$_c"
+done
+unset _c
+
+print_help() {
+    cat <<'EOF'
+craftctl - lightweight Minecraft server manager (PaperMC + systemd)
+
+Usage:
+  craftctl --help                          Show this help
+  craftctl --version                       Show version
+  craftctl --setup                         Initialise environment and dependencies
+  craftctl --update                        Update craftctl itself
+  craftctl --uninstall [--purge]           Remove craftctl (keeps worlds/backups unless --purge)
+
+  craftctl --create <name> [--version VER] [--memory MEM] [--port PORT] [--rcon-port PORT]
+  craftctl --delete <name> [--yes]
+  craftctl --list
+  craftctl --versions [--minecraft VER]    List available PaperMC versions
+  craftctl --info <name>
+
+  craftctl --start <name> | --start --all
+  craftctl --stop <name> | --stop --all
+  craftctl --restart <name> | --restart --all
+  craftctl --status [<name> | --all]
+
+  craftctl --backup <name> [--keep N]
+  craftctl --restore <name> [--file FILE] [--yes]
+  craftctl --update-server <name> [--version VER]
+  craftctl --logs <name> [--lines N] [--follow]
+  craftctl --send <name> <command...>
+
+  craftctl --whitelist add <name> <player>
+  craftctl --whitelist remove <name> <player>
+  craftctl --whitelist list <name>
+  craftctl --whitelist on <name>
+  craftctl --whitelist off <name>
+  craftctl --whitelist status <name>
+
+Options:
+  --all            Apply to all servers (with --start/--stop/--restart/--status)
+  --version VER    Minecraft version (e.g. 1.21.11). Default: latest stable PaperMC.
+  --memory MEM     Heap size, e.g. 2G, 4096M. Default: 2G.
+  --port PORT      Minecraft server port. Default: next free from 25565.
+  --rcon-port PORT RCON port (localhost only). Default: next free from 25575.
+  --yes, -y        Skip confirmation prompts (dangerous operations).
+  --lines N        Number of log lines to show (default 100).
+  --follow, -f     Follow log output.
+  --keep N         Retain at most N backups (default from config).
+  --file FILE      Backup file to restore from.
+
+Examples:
+  craftctl --setup
+  craftctl --create survival --version 1.21.11 --memory 4G
+  craftctl --start survival
+  craftctl --whitelist add survival Alex
+  craftctl --send survival "say Hello everyone!"
+
+Docs: https://github.com/ferranox/craftctl
+EOF
+}
+
+print_version() {
+    printf 'craftctl %s\n' "$CRAFTCTL_VERSION"
+}
+
+if [[ $# -eq 0 ]]; then
+    print_help
+    exit 0
+fi
+
+CMD="$1"
+shift || true
+
+retval=0
+case "$CMD" in
+    --help|-h|help) print_help; exit 0 ;;
+    --version|-V) print_version; exit 0 ;;
+    --setup) cmd_setup "$@" || retval=$? ;;
+    --update) cmd_self_update "$@" || retval=$? ;;
+    --uninstall) cmd_uninstall "$@" || retval=$? ;;
+    --create) cmd_create "$@" || retval=$? ;;
+    --delete) cmd_delete "$@" || retval=$? ;;
+    --list) cmd_list "$@" || retval=$? ;;
+    --versions) cmd_versions "$@" || retval=$? ;;
+    --info) cmd_info "$@" || retval=$? ;;
+    --start) cmd_start "$@" || retval=$? ;;
+    --stop) cmd_stop "$@" || retval=$? ;;
+    --restart) cmd_restart "$@" || retval=$? ;;
+    --status) cmd_status "$@" || retval=$? ;;
+    --backup) cmd_backup "$@" || retval=$? ;;
+    --restore) cmd_restore "$@" || retval=$? ;;
+    --update-server) cmd_update_server "$@" || retval=$? ;;
+    --logs) cmd_logs "$@" || retval=$? ;;
+    --send) cmd_send "$@" || retval=$? ;;
+    --whitelist) cmd_whitelist "$@" || retval=$? ;;
+    *) log_error "Unknown command '${CMD}'. Try 'craftctl --help'."; exit 2 ;;
+esac
+exit "$retval"

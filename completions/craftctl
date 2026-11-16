@@ -1,0 +1,68 @@
+# shellcheck shell=bash
+# craftctl bash completion
+# Install: sudo cp completions/craftctl /usr/share/bash-completion/completions/craftctl
+# Usage: craftctl --<TAB>
+
+_craftctl_complete() {
+    local cur prev words cword
+    # shellcheck disable=SC2034
+    _init_completion -n : 2>/dev/null || {
+        COMPREPLY=()
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    }
+
+    local commands="--help --version --setup --update --uninstall --create --delete --list --versions --info --start --stop --restart --status --backup --restore --update-server --logs --send --whitelist"
+
+    if [[ $cword -eq 1 ]]; then
+        # shellcheck disable=SC2207
+        COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+        return 0
+    fi
+
+    local cmd="${words[1]}"
+    case "$cmd" in
+        --whitelist)
+            if [[ $cword -eq 2 ]]; then
+                # shellcheck disable=SC2207
+                COMPREPLY=($(compgen -W "add remove list on off status" -- "$cur"))
+            elif [[ $cword -eq 3 && ( "${words[2]}" == "add" || "${words[2]}" == "remove" || "${words[2]}" == "list" || "${words[2]}" == "on" || "${words[2]}" == "off" || "${words[2]}" == "status" ) ]]; then
+                local servers=""
+                if [[ -d /var/lib/craftctl/servers ]]; then
+                    servers="$(ls /var/lib/craftctl/servers 2>/dev/null)"
+                fi
+                # shellcheck disable=SC2207
+                COMPREPLY=($(compgen -W "$servers" -- "$cur"))
+            fi
+            return 0
+            ;;
+        --create|--delete|--info|--start|--stop|--restart|--status|--backup|--restore|--update-server|--logs|--send)
+            if [[ "$cur" == -* ]]; then
+                local opts="--help"
+                case "$cmd" in
+                    --create) opts="--version --memory --port --rcon-port --help" ;;
+                    --delete) opts="--yes --help" ;;
+                    --start|--stop|--restart|--status) opts="--all --help" ;;
+                    --backup) opts="--keep --help" ;;
+                    --restore) opts="--file --yes --help" ;;
+                    --update-server) opts="--version --help" ;;
+                    --logs) opts="--lines --follow --help" ;;
+                esac
+                # shellcheck disable=SC2207
+                COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+            else
+                local servers=""
+                if [[ -d /var/lib/craftctl/servers ]]; then
+                    servers="$(ls /var/lib/craftctl/servers 2>/dev/null)"
+                fi
+                # shellcheck disable=SC2207
+                COMPREPLY=($(compgen -W "$servers --all" -- "$cur"))
+            fi
+            return 0
+            ;;
+    esac
+}
+
+complete -F _craftctl_complete craftctl

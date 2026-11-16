@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# craftctl - lib/server
+# Per-server filesystem layout, config generation and locking.
+# shellcheck shell=bash
+
+server_lock_file() {
+    local name="$1"
+    printf '%s\n' "${CRAFTCTL_LOCK_DIR}/craftctl-${name}.lock"
+}
+
+with_server_lock() {
+    local name="$1"
+    shift
+    ensure_dir "$CRAFTCTL_LOCK_DIR" 2>/dev/null || true
+    local lock
+    lock="$(server_lock_file "$name")"
+    ensure_dir "$(dirname "$lock")" 2>/dev/null || true
+    exec 9>"$lock" 2>/dev/null || { "$@"; return $?; }
+    if ! flock -n 9 2>/dev/null; then
+        log_error "Another operation is already running for server '${name}'."
+        exec 9>&-
+        return 1
+    fi
+    "$@"
+    local rc=$?
+    exec 9>&-
+    return $rc
+}
+
+server_jar_path() {
+    local name="$1"
+    printf '%s\n' "$(server_dir "$name")/server.jar"
+}
+
+server_log_path() {
+    local name="$1"
+    printf '%s\n' "$(server_dir "$name")/logs/latest.log"
+}
+
+generate_rcon_password() {
+    if has_cmd openssl; then
+        openssl rand -hex 16
+    else
+        tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32
+        printf '\n'
+    fi
+}
+
+rcon_password_file() {
+    local name="$1"
+    printf '%s\n' "${CRAFTCTL_ETC}/servers/${name}.rcon"
+}
+
+store_rcon_password() {
+    local name="$1" pass="$2"
+    local f
+    f="$(rcon_password_file "$name")"
+    ensure_dir "$(dirname "$f")"
+    printf '%s\n' "$pass" | atomic_write "$f" 600
+    if is_root && id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
+        chown "${CRAFTCTL_MC_USER}:root" "$f" 2>/dev/null || true
+    fi
+    chmod 600 "$f"
+}
+
+read_rcon_password() {
+    local name="$1"
+    local f
+    f="$(rcon_password_file "$name")"
+    [[ -f "$f" ]] || return 1
+    # first line, strip whitespace/newlines
+    head -n 1 "$f" | tr -d '\r\n'
+}
+
+write_server_config() {
+    local name="$1" mc_version="$2" build="$3" memory="$4"
+    local sport="$5" rport="$6" java_bin="$7" jvm_flags="$8"
+    local conf
+    conf="$(server_conf_path "$name")"
+    mkdir -p "$(dirname "$conf")" 2>/dev/null || true
+    {
+        printf '# craftctl server configuration for %s\n' "$name"
+        printf '# Managed by craftctl - edits may be overwritten by `craftctl --update-server`.\n'
+        printf 'SERVER_NAME=%s\n' "$name"
+        printf 'MC_VERSION=%s\n' "$mc_version"
+        printf 'PAPER_BUILD=%s\n' "$build"
+        printf 'MEMORY=%s\n' "$memory"
+        printf 'SERVER_PORT=%s\n' "$sport"
+        printf 'RCON_PORT=%s\n' "$rport"
+        printf 'JAVA_BIN=%s\n' "$java_bin"
+        printf 'JVM_FLAGS=%s\n' "$jvm_flags"
+        printf 'CREATED=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } | atomic_write "$conf" 640
+    if is_root && id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
+        chown "${CRAFTCTL_MC_USER}:root" "$conf" 2>/dev/null || true
+    fi
+}
+
+default_jvm_flags() {
+    # Aikar-inspired G1 defaults, conservative for Raspberry Pi.
+    printf '%s' "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem"
+}
+
+# Write or update server.properties for a server directory.
+write_server_properties() {
+    local dir="$1" sport="$2" rport="$3" rcon_pass="$4"
+    local f="${dir}/server.properties"
+    local tmp
+    tmp="$(mktemp "${dir}/.server.properties.XXXXXX")" || return 1
+    if [[ -f "$f" ]]; then
+        cp "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
+        # Preserve existing file but enforce managed keys.
+        cp "$f" "$tmp" || { rm -f "$tmp"; return 1; }
+        set_prop() {
+            local k="$1" v="$2" file="$3"
+            if grep -q "^${k}=" "$file"; then
+                sed -i "s|^${k}=.*|${k}=${v}|" "$file"
+            else
+                printf '%s=%s\n' "$k" "$v" >> "$file"
+            fi
+        }
+        set_prop "server-port" "$sport" "$tmp"
+        set_prop "enable-rcon" "true" "$tmp"
+        set_prop "rcon.port" "$rport" "$tmp"
+        set_prop "rcon.password" "$rcon_pass" "$tmp"
+        # Bind RCON to localhost only.
+        if grep -q "^rcon.ip=" "$tmp"; then
+            sed -i "s|^rcon.ip=.*|rcon.ip=127.0.0.1|" "$tmp"
+        else
+            printf 'rcon.ip=127.0.0.1\n' >> "$tmp"
+        fi
+    else
+        cat > "$tmp" <<EOF
+# Minecraft server properties (managed by craftctl)
+server-port=${sport}
+enable-rcon=true
+rcon.port=${rport}
+rcon.password=${rcon_pass}
+rcon.ip=127.0.0.1
+enable-query=false
+white-list=false
+motd=craftctl ${dir##*/} - Powered by PaperMC
+max-players=20
+view-distance=10
+simulation-distance=10
+difficulty=easy
+gamemode=survival
+spawn-protection=16
+online-mode=true
+EOF
+    fi
+    chmod 640 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+}
+
+accept_eula() {
+    local dir="$1"
+    printf '#By changing the setting below to TRUE you are indicating your agreement to our EULA (https://aka.ms/MinecraftEULA).\n#Managed by craftctl - server created %s\neula=true\n' "$(date -u +%Y-%m-%d)" | atomic_write "${dir}/eula.txt" 644
+}

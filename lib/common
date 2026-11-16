@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# craftctl - lib/common
+# Shared constants, path resolution and small utilities.
+# shellcheck shell=bash
+
+CRAFTCTL_VERSION="1.0.0"
+# Exported: consumed across lib/commands/installer (shellcheck: external use).
+export CRAFTCTL_REPO="https://github.com/ferranox/craftctl"
+export CRAFTCTL_RAW_BASE="https://raw.githubusercontent.com/ferranox/craftctl/main"
+export CRAFTCTL_USER_AGENT="craftctl/${CRAFTCTL_VERSION} (https://github.com/ferranox/craftctl)"
+
+# Overridable roots (used by tests to avoid touching the real system).
+CRAFTCTL_ROOT="${CRAFTCTL_ROOT:-/opt/craftctl}"
+CRAFTCTL_ETC="${CRAFTCTL_ETC:-/etc/craftctl}"
+CRAFTCTL_DATA="${CRAFTCTL_DATA:-/var/lib/craftctl/servers}"
+CRAFTCTL_BACKUP_ROOT="${CRAFTCTL_BACKUP_ROOT:-/var/backups/craftctl}"
+CRAFTCTL_SYSTEMD_DIR="${CRAFTCTL_SYSTEMD_DIR:-/etc/systemd/system}"
+CRAFTCTL_BIN_PATH="${CRAFTCTL_BIN_PATH:-/usr/local/bin/craftctl}"
+CRAFTCTL_LOCK_DIR="${CRAFTCTL_LOCK_DIR:-/var/lock/craftctl}"
+CRAFTCTL_MC_USER="${CRAFTCTL_MC_USER:-minecraft}"
+
+FILL_API_BASE="${FILL_API_BASE:-https://fill.papermc.io/v3}"
+PAPER_PROJECT="${PAPER_PROJECT:-paper}"
+
+# Resolve the directory containing the installed application (or repo checkout).
+craftctl_app_dir() {
+    local src="${BASH_SOURCE[0]:-}"
+    # When sourced from $CRAFTCTL_ROOT/lib/common this resolves to $CRAFTCTL_ROOT.
+    if [[ -n "${CRAFTCTL_APP_DIR:-}" ]]; then
+        printf '%s\n' "$CRAFTCTL_APP_DIR"
+        return 0
+    fi
+    local dir
+    dir="$(cd "$(dirname "$src")/.." 2>/dev/null && pwd)" || dir="$CRAFTCTL_ROOT"
+    printf '%s\n' "$dir"
+}
+
+craftctl_lib_dir() {
+    if [[ -d "${CRAFTCTL_ROOT}/lib" ]]; then
+        printf '%s\n' "${CRAFTCTL_ROOT}/lib"
+    else
+        printf '%s\n' "$(craftctl_app_dir)/lib"
+    fi
+}
+
+is_root() {
+    [[ "$(id -u)" -eq 0 ]]
+}
+
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Run a command as the minecraft user when we are root, otherwise run directly.
+as_mc_user() {
+    if is_root; then
+        if id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
+            runuser -u "$CRAFTCTL_MC_USER" -- "$@"
+        else
+            "$@"
+        fi
+    else
+        "$@"
+    fi
+}
+
+# Run with sudo only when not root and sudo exists.
+need_root() {
+    if is_root; then
+        "$@"
+    elif has_cmd sudo; then
+        sudo "$@"
+    else
+        log_error "This operation requires root privileges but 'sudo' is not available."
+        return 1
+    fi
+}
+
+ensure_dir() {
+    local dir="$1"
+    local mode="${2:-}"
+    if [[ ! -d "$dir" ]]; then
+        mkdir -p "$dir" || return 1
+    fi
+    if [[ -n "$mode" ]]; then
+        chmod "$mode" "$dir" || return 1
+    fi
+}
+
+# Atomic write: write stdin to tmp file then move into place.
+atomic_write() {
+    local dest="$1"
+    local mode="${2:-644}"
+    local tmp
+    tmp="$(mktemp "$(dirname "$dest")/.tmp.XXXXXX")" || return 1
+    cat > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
+}
+
+cleanup_tmp() {
+    local p
+    for p in "$@"; do
+        [[ -n "$p" ]] && rm -rf "$p"
+    done
+}
+
+mktemp_dir() {
+    mktemp -d "${TMPDIR:-/tmp}/craftctl.XXXXXX"
+}
+
+require_nonempty() {
+    local name="$1"
+    local value="${2:-}"
+    if [[ -z "$value" ]]; then
+        log_error "Missing required argument: ${name}"
+        return 1
+    fi
+}
+
+# Prompt with default; prints result to stdout. Reads from stdin.
+prompt_default() {
+    local prompt="$1"
+    local default_value="${2:-}"
+    local answer=""
+    if [[ -t 0 ]]; then
+        if [[ -n "$default_value" ]]; then
+            printf '%s [%s]: ' "$prompt" "$default_value" >&2
+        else
+            printf '%s: ' "$prompt" >&2
+        fi
+        IFS= read -r answer || answer=""
+        if [[ -z "$answer" ]]; then
+            answer="$default_value"
+        fi
+        printf '%s\n' "$answer"
+    else
+        printf '%s\n' "$default_value"
+    fi
+}
+
+prompt_yes_no() {
+    local prompt="$1"
+    local default_value="${2:-n}"
+    local answer
+    answer="$(prompt_default "$prompt (y/n)" "$default_value")"
+    case "$answer" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}

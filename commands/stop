@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# craftctl command: stop
+# shellcheck shell=bash
+
+cmd_stop() {
+    local target
+    # Reuse target helper from start command if loaded, else inline.
+    if declare -F _lifecycle_target >/dev/null 2>&1; then
+        target="$(_lifecycle_target "$@")" || return $?
+    else
+        if [[ $# -eq 0 ]]; then log_error "Missing server name. Usage with <name> or --all."; return 2; fi
+        if [[ "$1" == "--all" ]]; then target="ALL"; else
+            validate_server_name "$1" || return 1
+            server_exists "$1" || { log_error "Server '$1' does not exist."; return 1; }
+            target="$1"
+        fi
+    fi
+    if [[ "$target" == "ALL" ]]; then
+        local s rc=0
+        while IFS= read -r s; do
+            [[ -n "$s" ]] || continue
+            _stop_one "$s" || rc=1
+        done < <(list_servers)
+        return $rc
+    fi
+    _stop_one "$target"
+}
+
+_stop_one() {
+    local name="$1"
+    if ! service_is_active "$name" 2>/dev/null; then
+        log_info "Server '${name}' is already stopped."
+        return 0
+    fi
+    log_info "Stopping server '${name}' (graceful shutdown)..."
+    rcon_send "$name" "save-all" >/dev/null 2>&1 || true
+    if ! service_stop "$name"; then
+        log_error "Failed to stop '${name}'."
+        return 1
+    fi
+    if wait_for_state "$name" inactive 60 2>/dev/null; then
+        log_ok "Server '${name}' stopped."
+    else
+        log_warn "Stop issued for '${name}' but service did not become inactive in time."
+        return 1
+    fi
+}

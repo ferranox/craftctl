@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# craftctl - lib/config
+# Configuration loading/saving for global and per-server config.
+# shellcheck shell=bash
+
+# Global config path: $CRAFTCTL_ETC/craftctl.conf
+global_conf_path() {
+    printf '%s\n' "${CRAFTCTL_ETC}/craftctl.conf"
+}
+
+server_conf_path() {
+    local name="$1"
+    printf '%s\n' "${CRAFTCTL_DATA}/${name}/config.conf"
+}
+
+server_dir() {
+    local name="$1"
+    printf '%s\n' "${CRAFTCTL_DATA}/${name}"
+}
+
+# Load KEY=VALUE file safely (no eval of arbitrary code): only simple assignments.
+load_conf_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # strip leading/trailing whitespace
+        line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            # strip surrounding quotes if present
+            if [[ ${#value} -ge 2 ]]; then
+                if [[ "$value" == \"*\" ]]; then
+                    value="${value:1:${#value}-2}"
+                elif [[ "$value" == \'*\' ]]; then
+                    value="${value:1:${#value}-2}"
+                fi
+            fi
+            printf -v "$key" '%s' "$value"
+        fi
+    done < "$file"
+}
+
+# Read a single key from a conf file without polluting environment.
+conf_get() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" == "${key}="* ]]; then
+            local value="${line#*=}"
+            if [[ ${#value} -ge 2 ]]; then
+                if [[ "$value" == \"*\" ]]; then
+                    value="${value:1:${#value}-2}"
+                elif [[ "$value" == \'*\' ]]; then
+                    value="${value:1:${#value}-2}"
+                fi
+            fi
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
+# Set or update a single KEY=VALUE in a conf file atomically.
+conf_set() {
+    local file="$1" key="$2" value="$3"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        log_error "Invalid config key '${key}'."
+        return 1
+    fi
+    # escape: values are stored raw; newlines are rejected.
+    if [[ "$value" == *$'\n'* ]]; then
+        log_error "Invalid config value: must not contain newlines."
+        return 1
+    fi
+    local tmp
+    tmp="$(mktemp "$(dirname "$file")/.tmp.XXXXXX")" || return 1
+    if [[ -f "$file" ]]; then
+        # shellcheck disable=SC2016
+        awk -v k="$key" -v v="$value" '
+            BEGIN { done=0 }
+            {
+                line=$0
+                stripped=line
+                sub(/^[ \t]+/, "", stripped)
+                if (stripped ~ "^" k "=" && done==0) {
+                    print k "=" v
+                    done=1
+                } else {
+                    print line
+                }
+            }
+            END { if (done==0) print k "=" v }
+        ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    else
+        printf '%s=%s\n' "$key" "$value" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    chmod 640 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
+# Load global config with defaults.
+load_global_config() {
+    DEFAULT_VERSION="${DEFAULT_VERSION:-}"
+    DEFAULT_MEMORY="${DEFAULT_MEMORY:-2G}"
+    DEFAULT_PORT="${DEFAULT_PORT:-25565}"
+    BACKUP_RETENTION="${BACKUP_RETENTION:-7}"
+    JAVA_DIR="${JAVA_DIR:-}"
+    local f
+    f="$(global_conf_path)"
+    if [[ -f "$f" ]]; then
+        # Use conf_get to avoid arbitrary execution.
+        local v
+        v="$(conf_get "$f" DEFAULT_VERSION 2>/dev/null)" && DEFAULT_VERSION="$v"
+        v="$(conf_get "$f" DEFAULT_MEMORY 2>/dev/null)" && DEFAULT_MEMORY="$v"
+        v="$(conf_get "$f" DEFAULT_PORT 2>/dev/null)" && DEFAULT_PORT="$v"
+        v="$(conf_get "$f" BACKUP_RETENTION 2>/dev/null)" && BACKUP_RETENTION="$v"
+        v="$(conf_get "$f" JAVA_DIR 2>/dev/null)" && JAVA_DIR="$v"
+    fi
+    export DEFAULT_VERSION DEFAULT_MEMORY DEFAULT_PORT BACKUP_RETENTION JAVA_DIR
+}
+
+# Load per-server config into variables with SERVER_ prefix to avoid collisions.
+# Sets: SERVER_NAME, SERVER_VERSION, SERVER_MEMORY, SERVER_PORT, SERVER_RCON_PORT,
+#       SERVER_JAVA, SERVER_JVM_FLAGS, SERVER_BUILD
+load_server_config() {
+    local name="$1"
+    local conf
+    conf="$(server_conf_path "$name")"
+    [[ -f "$conf" ]] || return 1
+    SERVER_NAME="$name"
+    SERVER_VERSION="$(conf_get "$conf" MC_VERSION 2>/dev/null || true)"
+    SERVER_MEMORY="$(conf_get "$conf" MEMORY 2>/dev/null || true)"
+    SERVER_PORT="$(conf_get "$conf" SERVER_PORT 2>/dev/null || true)"
+    SERVER_RCON_PORT="$(conf_get "$conf" RCON_PORT 2>/dev/null || true)"
+    SERVER_JAVA="$(conf_get "$conf" JAVA_BIN 2>/dev/null || true)"
+    SERVER_JVM_FLAGS="$(conf_get "$conf" JVM_FLAGS 2>/dev/null || true)"
+    SERVER_BUILD="$(conf_get "$conf" PAPER_BUILD 2>/dev/null || true)"
+    export SERVER_NAME SERVER_VERSION SERVER_MEMORY SERVER_PORT SERVER_RCON_PORT
+    export SERVER_JAVA SERVER_JVM_FLAGS SERVER_BUILD
+}
+
+server_exists() {
+    local name="$1"
+    [[ -d "${CRAFTCTL_DATA}/${name}" && -f "${CRAFTCTL_DATA}/${name}/config.conf" ]]
+}
+
+list_servers() {
+    [[ -d "$CRAFTCTL_DATA" ]] || return 0
+    local d
+    for d in "$CRAFTCTL_DATA"/*/; do
+        [[ -d "$d" ]] || continue
+        local base
+        base="$(basename "$d")"
+        if [[ -f "${d}config.conf" ]]; then
+            printf '%s\n' "$base"
+        fi
+    done | sort
+}
+
+# Find a free game port and rcon port, starting from defaults.
+find_free_port() {
+    local start="${1:-25565}"
+    local used="$2"
+    local port="$start"
+    local tries=0
+    while [[ $tries -lt 1000 ]]; do
+        if ! printf '%s\n' "$used" | grep -qx "$port"; then
+            if ! (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":${port} ") ; then
+                printf '%s\n' "$port"
+                return 0
+            fi
+        fi
+        port=$((port + 1))
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+collect_used_ports() {
+    local s f
+    [[ -d "$CRAFTCTL_DATA" ]] || return 0
+    for f in "$CRAFTCTL_DATA"/*/config.conf; do
+        [[ -f "$f" ]] || continue
+        s="$(conf_get "$f" SERVER_PORT 2>/dev/null || true)"
+        [[ -n "$s" ]] && printf '%s\n' "$s"
+        s="$(conf_get "$f" RCON_PORT 2>/dev/null || true)"
+        [[ -n "$s" ]] && printf '%s\n' "$s"
+    done
+}
+
+port_in_use_by_other() {
+    local port="$1" exclude="${2:-}"
+    local f s name
+    for f in "$CRAFTCTL_DATA"/*/config.conf; do
+        [[ -f "$f" ]] || continue
+        name="$(basename "$(dirname "$f")")"
+        [[ "$name" == "$exclude" ]] && continue
+        s="$(conf_get "$f" SERVER_PORT 2>/dev/null || true)"
+        [[ "$s" == "$port" ]] && return 0
+        s="$(conf_get "$f" RCON_PORT 2>/dev/null || true)"
+        [[ "$s" == "$port" ]] && return 0
+    done
+    return 1
+}

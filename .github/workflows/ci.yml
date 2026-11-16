@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update -y && sudo apt-get install -y shellcheck
+      - name: Run ShellCheck
+        run: |
+          shellcheck --severity=warning \
+            craftctl api install uninstall \
+            lib/* commands/* \
+            completions/craftctl
+
+  bats:
+    name: Bats tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Bats and deps
+        run: sudo apt-get update -y && sudo apt-get install -y bats jq curl
+      - name: Run Bats suites
+        run: |
+          bats tests/test-commands
+          bats tests/test-config
+          bats tests/test-whitelist
+          bats tests/test-install
+
+  repo-hygiene:
+    name: Repository hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for leftover placeholders and bad URLs
+        run: |
+          set -e
+          echo "Checking for TODO/FIXME placeholders in shipped code..."
+          if grep -rn -E '\b(TODO|FIXME|HACK)\b' craftctl api lib commands install uninstall systemd data completions 2>/dev/null | grep -v '^Binary'; then
+            echo "::error::Placeholder markers found; resolve or document them."
+            exit 1
+          fi
+          echo "Checking repository URL consistency..."
+          # MSCS inspiration link is explicitly allowed; everything else must be ferranox/craftctl.
+          if grep -rn 'github.com/' README.md docs/ craftctl install uninstall api 2>/dev/null | grep -v 'ferranox/craftctl' | grep -v 'MinecraftServerControl/mscs'; then
+            echo "::error::Found GitHub URL not pointing to ferranox/craftctl (allowed exception: MSCS inspiration link)"
+            exit 1
+          fi
+          grep -q 'ferranox/craftctl' README.md
+          test -f LICENSE
+          test -f README.md
+          test -x craftctl
+          echo "Hygiene OK."

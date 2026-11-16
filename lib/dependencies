@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# craftctl - lib/dependencies
+# OS detection and dependency installation.
+# shellcheck shell=bash
+
+detect_os() {
+    CRAFTCTL_OS_ID=""
+    CRAFTCTL_OS_VERSION=""
+    CRAFTCTL_OS_CODENAME=""
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        CRAFTCTL_OS_ID="${ID:-unknown}"
+        CRAFTCTL_OS_VERSION="${VERSION_ID:-unknown}"
+        CRAFTCTL_OS_CODENAME="${VERSION_CODENAME:-}"
+        if [[ -z "$CRAFTCTL_OS_CODENAME" && -n "${UBUNTU_CODENAME:-}" ]]; then
+            CRAFTCTL_OS_CODENAME="$UBUNTU_CODENAME"
+        fi
+    else
+        CRAFTCTL_OS_ID="unknown"
+    fi
+    export CRAFTCTL_OS_ID CRAFTCTL_OS_VERSION CRAFTCTL_OS_CODENAME
+}
+
+detect_arch() {
+    CRAFTCTL_ARCH="$(uname -m 2>/dev/null || echo unknown)"
+    case "$CRAFTCTL_ARCH" in
+        x86_64|amd64) CRAFTCTL_ARCH="x86_64" ;;
+        aarch64|arm64) CRAFTCTL_ARCH="aarch64" ;;
+        armv7l|armhf) CRAFTCTL_ARCH="armv7l" ;;
+        *) ;;
+    esac
+    export CRAFTCTL_ARCH
+}
+
+check_systemd() {
+    if [[ ! -d /run/systemd/system ]]; then
+        log_error "systemd does not appear to be running (no /run/systemd/system)."
+        log_error "craftctl requires a systemd-based Linux system."
+        return 1
+    fi
+    if ! has_cmd systemctl; then
+        log_error "'systemctl' not found. systemd utilities are required."
+        return 1
+    fi
+    return 0
+}
+
+check_supported_os() {
+    detect_os
+    detect_arch
+    local id="$CRAFTCTL_OS_ID"
+    case "$id" in
+        debian|ubuntu|raspbian) ;;
+        *)
+            log_error "Unsupported distribution '${id}'. Supported: Debian, Ubuntu Server, Raspberry Pi OS (64-bit)."
+            log_error "See docs/installation.md for details."
+            return 1
+            ;;
+    esac
+    case "$CRAFTCTL_ARCH" in
+        x86_64|aarch64) ;;
+        *)
+            log_error "Unsupported architecture '${CRAFTCTL_ARCH}'. Only 64-bit x86_64 and aarch64 are supported."
+            log_error "32-bit ARM (armv7l/armhf) cannot run modern PaperMC/Java."
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+required_packages() {
+    # Minimal set. RCON handled via bundled approach; mcrcon optional.
+    printf '%s\n' bash curl wget git jq coreutils procps openssl tar gzip findutils sed gawk grep systemd
+}
+
+install_dependencies() {
+    local p
+    local missing=()
+    # map check: command presence (best-effort)
+    for p in curl jq git tar gzip openssl; do
+        if ! has_cmd "$p"; then
+            missing+=("$p")
+        fi
+    done
+    if [[ ! -f /etc/debian_version ]]; then
+        log_warn "APT-based installation expected; skipping apt install on non-APT system."
+        return 0
+    fi
+    if ! has_cmd apt-get; then
+        log_warn "apt-get not found; cannot auto-install dependencies."
+        return 0
+    fi
+    log_info "Updating package lists..."
+    need_root apt-get update -y || return 1
+    # Translate missing commands to packages
+    local to_install=()
+    has_cmd curl || to_install+=(curl)
+    has_cmd wget || to_install+=(wget)
+    has_cmd git || to_install+=(git)
+    has_cmd jq || to_install+=(jq)
+    has_cmd tar || to_install+=(tar)
+    has_cmd gzip || to_install+=(gzip)
+    has_cmd openssl || to_install+=(openssl)
+    has_cmd gawk || has_cmd awk || to_install+=(gawk)
+    # ca-certificates always useful for TLS
+    to_install+=(ca-certificates procps findutils coreutils)
+    # de-duplicate
+    local uniq=()
+    local seen=""
+    for p in "${to_install[@]}"; do
+        if [[ "$seen" != *" $p "* ]]; then
+            uniq+=("$p")
+            seen+=" $p "
+        fi
+    done
+    if [[ ${#uniq[@]} -gt 0 ]]; then
+        log_info "Installing dependencies: ${uniq[*]}"
+        DEBIAN_FRONTEND=noninteractive need_root apt-get install -y --no-install-recommends "${uniq[@]}" || return 1
+    else
+        log_info "All core dependencies already present."
+    fi
+}

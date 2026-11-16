@@ -1,0 +1,107 @@
+#!/usr/bin/env bats
+# craftctl tests: whitelist operations (offline path + validation).
+
+setup() {
+    export CRAFTCTL_ROOT="$BATS_TEST_DIRNAME/.."
+    export CRAFTCTL_ETC="$(mktemp -d)"
+    export CRAFTCTL_DATA="$(mktemp -d)"
+    export CRAFTCTL_BACKUP_ROOT="$(mktemp -d)"
+    export CRAFTCTL_LOCK_DIR="$(mktemp -d)"
+    export CRAFTCTL_SYSTEMD_DIR="$(mktemp -d)"
+    export CRAFTCTL_MC_USER="nobody"
+    # shellcheck disable=SC1091
+    source "${CRAFTCTL_ROOT}/api"
+    for _cf in "${CRAFTCTL_ROOT}"/commands/*; do
+        # shellcheck disable=SC1090
+        source "$_cf"
+    done
+    mkdir -p "$CRAFTCTL_ETC/servers"
+    # offline server fixture
+    export TEST_SRV="wlsrv"
+    mkdir -p "$(server_dir "$TEST_SRV")"
+    printf 'SERVER_NAME=%s\nSERVER_PORT=25565\nRCON_PORT=25575\n' "$TEST_SRV" > "$(server_conf_path "$TEST_SRV")"
+    printf 'white-list=false\n' > "$(server_dir "$TEST_SRV")/server.properties"
+    service_is_active() { return 1; }
+    export -f service_is_active
+}
+
+teardown() {
+    rm -rf "$CRAFTCTL_ETC" "$CRAFTCTL_DATA" "$CRAFTCTL_BACKUP_ROOT" "$CRAFTCTL_LOCK_DIR" "$CRAFTCTL_SYSTEMD_DIR"
+}
+
+@test "whitelist add offline creates entry" {
+    mojang_uuid_for() { return 1; }
+    export -f mojang_uuid_for
+    run cmd_whitelist add "$TEST_SRV" Alex
+    [ "$status" -eq 0 ]
+    run cmd_whitelist list "$TEST_SRV"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Alex"* ]]
+}
+
+@test "whitelist add is idempotent" {
+    mojang_uuid_for() { return 1; }
+    export -f mojang_uuid_for
+    cmd_whitelist add "$TEST_SRV" Alex
+    run cmd_whitelist add "$TEST_SRV" Alex
+    [ "$status" -eq 0 ]
+    count="$(jq -r 'length' "$(whitelist_file "$TEST_SRV")")"
+    [ "$count" -eq 1 ]
+}
+
+@test "whitelist remove offline deletes entry" {
+    mojang_uuid_for() { return 1; }
+    export -f mojang_uuid_for
+    cmd_whitelist add "$TEST_SRV" Alex
+    run cmd_whitelist remove "$TEST_SRV" Alex
+    [ "$status" -eq 0 ]
+    count="$(jq -r 'length' "$(whitelist_file "$TEST_SRV")")"
+    [ "$count" -eq 0 ]
+}
+
+@test "whitelist rejects bad usernames" {
+    run cmd_whitelist add "$TEST_SRV" "ab"
+    [ "$status" -ne 0 ]
+    run cmd_whitelist add "$TEST_SRV" "bad name!"
+    [ "$status" -ne 0 ]
+}
+
+@test "whitelist on/off edits server.properties offline" {
+    run cmd_whitelist on "$TEST_SRV"
+    [ "$status" -eq 0 ]
+    grep -q "^white-list=true$" "$(server_dir "$TEST_SRV")/server.properties"
+    run cmd_whitelist off "$TEST_SRV"
+    [ "$status" -eq 0 ]
+    grep -q "^white-list=false$" "$(server_dir "$TEST_SRV")/server.properties"
+}
+
+@test "whitelist status shows entries and state" {
+    mojang_uuid_for() { return 1; }
+    export -f mojang_uuid_for
+    cmd_whitelist add "$TEST_SRV" Alex >/dev/null
+    run cmd_whitelist status "$TEST_SRV"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"offline"* ]]
+}
+
+@test "whitelist requires server to exist" {
+    run cmd_whitelist add nosuchserver Alex
+    [ "$status" -ne 0 ]
+}
+
+@test "whitelist rejects unknown action" {
+    run cmd_whitelist frobnicate "$TEST_SRV"
+    [ "$status" -ne 0 ]
+}
+
+@test "offline_whitelist_add stores uuid when provided" {
+    offline_whitelist_add "$TEST_SRV" Steve "12345678-1234-1234-1234-123456789012"
+    entry="$(jq -r '.[0].uuid' "$(whitelist_file "$TEST_SRV")")"
+    [ "$entry" = "12345678-1234-1234-1234-123456789012" ]
+}
+
+@test "whitelist list reports empty cleanly" {
+    run cmd_whitelist list "$TEST_SRV"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"No whitelisted players"* ]]
+}

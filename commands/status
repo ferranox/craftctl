@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# craftctl command: status
+# shellcheck shell=bash
+
+cmd_status() {
+    if [[ $# -eq 0 ]]; then
+        log_error "Usage: craftctl --status <name> | --status --all"
+        return 2
+    fi
+    if [[ "$1" == "--all" ]]; then
+        local s rc=0
+        while IFS= read -r s; do
+            [[ -n "$s" ]] || continue
+            _status_one "$s" || rc=1
+        done < <(list_servers)
+        return $rc
+    fi
+    local name="$1"
+    validate_server_name "$name" || return 1
+    if ! server_exists "$name"; then
+        log_error "Server '${name}' does not exist."
+        return 1
+    fi
+    _status_one "$name"
+}
+
+_status_one() {
+    local name="$1"
+    if service_is_active "$name" 2>/dev/null; then
+        printf '%-16s running\n' "$name"
+        return 0
+    else
+        printf '%-16s stopped\n' "$name"
+        if systemctl_cmd is-failed --quiet "$(service_name_for "$name")" 2>/dev/null; then
+            log_warn "Service craftctl@${name} is in FAILED state. See: journalctl -u craftctl@${name}"
+            return 1
+        fi
+        return 0
+    fi
+}

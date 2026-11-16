@@ -1,0 +1,32 @@
+[Unit]
+Description=Craftctl Minecraft server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+# Each server lives in /var/lib/craftctl/servers/<name>.
+# Overridable for tests via Environment=CRAFTCTL_* (see lib/common).
+WorkingDirectory=/var/lib/craftctl/servers/%i
+ExecStart=/bin/bash -c 'set -euo pipefail; d="/var/lib/craftctl/servers/%i"; conf="$d/config.conf"; mem="2G"; java="/usr/bin/java"; flags=""; if [ -f "$conf" ]; then mem="$(grep -E "^MEMORY=" "$conf" | cut -d= -f2 | tail -n1)"; java="$(grep -E "^JAVA_BIN=" "$conf" | cut -d= -f2 | tail -n1)"; flags="$(grep -E "^JVM_FLAGS=" "$conf" | cut -d= -f2- | tail -n1)"; fi; [ -n "$mem" ] || mem="2G"; [ -x "$java" ] || java="/usr/bin/java"; if [ ! -f "$d/server.jar" ]; then echo "server.jar missing in $d" >&2; exit 1; fi; echo "$mem" | grep -Eq "^[0-9]+[MGmg]$" || mem="2G"; exec "$java" -Xms"$mem" -Xmx"$mem" $flags -jar "$d/server.jar" --nogui'
+# PaperMC shuts down gracefully on SIGTERM (saves worlds). Give it time.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+SuccessExitStatus=0 143
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=craftctl-%i
+# Hardening (still allows writing to the server directory).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/craftctl/servers/%i /tmp
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

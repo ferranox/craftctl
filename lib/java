@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# craftctl - lib/java
+# Java version mapping, discovery and installation.
+#
+# Verified against https://docs.papermc.io/paper/getting-started/ (Sep 2026):
+#   1.7.10-1.11 -> 8, 1.12-1.16.4 -> 11, 1.16.5 -> 16,
+#   1.17-1.19 -> 17, 1.20-1.21.x -> 21, 26.x -> 25.
+# shellcheck shell=bash
+
+# Map a Minecraft/Paper version to the required Java major version.
+java_required_for_mc() {
+    local ver="${1:-}"
+    # Strip pre-release suffixes like -rc-3, -pre5 for comparison.
+    local base="${ver%%-*}"
+    if [[ "$base" =~ ^26\. ]]; then
+        printf '25\n'
+        return 0
+    fi
+    if [[ "$base" =~ ^1\.([0-9]+)(\.([0-9]+))? ]]; then
+        local minor="${BASH_REMATCH[1]}"
+        local patch="${BASH_REMATCH[3]:-0}"
+        if [[ "$minor" -lt 12 ]]; then
+            # 1.7 - 1.11
+            printf '8\n'
+            return 0
+        elif [[ "$minor" -eq 12 || "$minor" -eq 13 || "$minor" -eq 14 || "$minor" -eq 15 ]]; then
+            printf '11\n'
+            return 0
+        elif [[ "$minor" -eq 16 ]]; then
+            if [[ "$patch" -eq 5 ]]; then
+                printf '16\n'
+            else
+                printf '11\n'
+            fi
+            return 0
+        elif [[ "$minor" -eq 17 || "$minor" -eq 18 || "$minor" -eq 19 ]]; then
+            printf '17\n'
+            return 0
+        elif [[ "$minor" -eq 20 || "$minor" -eq 21 ]]; then
+            printf '21\n'
+            return 0
+        else
+            # Future 1.x: assume latest known LTS (21), caller verifies via Fill API minimum.
+            printf '21\n'
+            return 0
+        fi
+    fi
+    log_error "Cannot determine Java version for Minecraft version '${ver}'."
+    return 1
+}
+
+# Candidate java binary locations for a given major version.
+java_candidates_for() {
+    local major="$1"
+    local c
+    # Explicit override dir
+    if [[ -n "${JAVA_DIR:-}" && -d "$JAVA_DIR" ]]; then
+        printf '%s\n' "$JAVA_DIR"
+    fi
+    if [[ -n "${CRAFTCTL_JAVA_ROOT:-}" && -d "$CRAFTCTL_JAVA_ROOT" ]]; then
+        for c in "$CRAFTCTL_JAVA_ROOT"/*"$major"*/bin/java; do
+            [[ -x "$c" ]] && printf '%s\n' "$c"
+        done
+    fi
+    printf '%s\n' \
+        "/usr/lib/jvm/temurin-${major}-jre-amd64/bin/java" \
+        "/usr/lib/jvm/temurin-${major}-jre-arm64/bin/java" \
+        "/usr/lib/jvm/temurin-${major}-jdk-amd64/bin/java" \
+        "/usr/lib/jvm/temurin-${major}-jdk-arm64/bin/java" \
+        "/opt/java/temurin-${major}/bin/java" \
+        "/opt/java/${major}/bin/java" \
+        "/usr/lib/jvm/java-${major}-openjdk-amd64/bin/java" \
+        "/usr/lib/jvm/java-${major}-openjdk-arm64/bin/java" \
+        "/usr/lib/jvm/java-${major}-openjdk/bin/java" \
+        "/usr/lib/jvm/adoptopenjdk-${major}-hotspot-amd64/bin/java" \
+        "/usr/lib/jvm/adoptopenjdk-${major}-hotspot-arm64/bin/java"
+}
+
+find_java_for_major() {
+    local major="$1"
+    local c
+    while IFS= read -r c; do
+        if [[ -x "$c" ]]; then
+            # Verify it actually reports (best effort, ignore failures under test stubs)
+            printf '%s\n' "$c"
+            return 0
+        fi
+    done < <(java_candidates_for "$major")
+    # Fall back to PATH lookup: java -version parsing
+    if has_cmd "java${major}"; then
+        command -v "java${major}"
+        return 0
+    fi
+    if has_cmd java; then
+        local out
+        out="$(java -version 2>&1 | head -n 1 || true)"
+        # Match e.g. openjdk version "21.0.3" or 1.8.0
+        if [[ "$out" == *"\"${major}."* || "$out" == *"\"${major}\""* || "$out" == *"\"1.${major}."* ]]; then
+            command -v java
+            return 0
+        fi
+        # For major 8 the version string is 1.8.x
+        if [[ "$major" == "8" && "$out" == *'"1.8.'* ]]; then
+            command -v java
+            return 0
+        fi
+    fi
+    return 1
+}
+
+apt_java_package_for() {
+    local major="$1"
+    case "$major" in
+        8) printf 'openjdk-8-jre-headless\n' ;;
+        11) printf 'openjdk-11-jre-headless\n' ;;
+        17) printf 'openjdk-17-jre-headless\n' ;;
+        21) printf 'openjdk-21-jre-headless\n' ;;
+        *) printf '\n' ;;
+    esac
+}
+
+temurin_arch() {
+    case "${CRAFTCTL_ARCH:-$(uname -m)}" in
+        x86_64|amd64) printf 'x64\n' ;;
+        aarch64|arm64) printf 'aarch64\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+temurin_download_url() {
+    local major="$1"
+    local arch
+    arch="$(temurin_arch)" || return 1
+    # Eclipse Temurin (Adoptium) API: JRE, hotspot, linux.
+    printf 'https://api.adoptium.net/v3/binary/latest/%s/ga/linux/%s/jre/hotspot/normal/eclipse\n' "$major" "$arch"
+}
+
+install_java_for_major() {
+    local major="$1"
+    local found
+    if found="$(find_java_for_major "$major")"; then
+        log_info "Java ${major} already available: ${found}"
+        printf '%s\n' "$found"
+        return 0
+    fi
+    log_info "Installing Java ${major} runtime..."
+    # 1) Try distribution package when one exists.
+    local pkg
+    pkg="$(apt_java_package_for "$major")"
+    if [[ -n "$pkg" ]] && has_cmd apt-get; then
+        log_info "Trying APT package ${pkg}..."
+        if DEBIAN_FRONTEND=noninteractive need_root apt-get install -y --no-install-recommends "$pkg" 2>/dev/null; then
+            if found="$(find_java_for_major "$major")"; then
+                log_ok "Installed Java ${major} via APT: ${found}"
+                printf '%s\n' "$found"
+                return 0
+            fi
+        else
+            log_warn "APT package ${pkg} not available; falling back to Temurin."
+        fi
+    fi
+    # 2) Temurin tarball (works for 8, 11, 16, 17, 21, 25 on x64/aarch64).
+    local arch url tmpdir dest
+    arch="$(temurin_arch)" || { log_error "Unsupported architecture for Temurin download."; return 1; }
+    url="$(temurin_download_url "$major")"
+    tmpdir="$(mktemp_dir)" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+    log_info "Downloading Temurin ${major} JRE for linux/${arch}..."
+    local ua="craftctl/${CRAFTCTL_VERSION} (https://github.com/ferranox/craftctl)"
+    if ! curl -fsSL -A "$ua" -o "${tmpdir}/jre.tar.gz" "$url"; then
+        log_error "Failed to download Temurin Java ${major} from Adoptium API."
+        log_error "URL: ${url}"
+        return 1
+    fi
+    dest="/opt/java/temurin-${major}"
+    need_root mkdir -p "$(dirname "$dest")" || return 1
+    need_root rm -rf "$dest" || return 1
+    # Extract: Temurin tarball has a single top-level directory.
+    local stage="${tmpdir}/stage"
+    mkdir -p "$stage" || return 1
+    if ! tar -xzf "${tmpdir}/jre.tar.gz" -C "$stage"; then
+        log_error "Failed to extract Java ${major} archive (download may be corrupt)."
+        return 1
+    fi
+    local top
+    top="$(find "$stage" -mindepth 1 -maxdepth 1 | head -n 1)"
+    if [[ -z "$top" ]]; then
+        log_error "Java archive was empty."
+        return 1
+    fi
+    need_root mv "$top" "$dest" || return 1
+    if [[ -x "${dest}/bin/java" ]]; then
+        log_ok "Installed Temurin Java ${major} to ${dest}."
+        printf '%s\n' "${dest}/bin/java"
+        return 0
+    fi
+    log_error "Java ${major} installation failed: ${dest}/bin/java not executable."
+    return 1
+}
+
+ensure_java_for_version() {
+    local mc_version="$1"
+    local major
+    major="$(java_required_for_mc "$mc_version")" || return 1
+    local bin
+    if bin="$(find_java_for_major "$major")"; then
+        printf '%s\n' "$bin"
+        return 0
+    fi
+    install_java_for_major "$major"
+}

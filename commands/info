@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# craftctl command: info
+# shellcheck shell=bash
+
+cmd_info() {
+    local name="${1:-}"
+    if [[ -z "$name" || "$name" == -* ]]; then
+        log_error "Usage: craftctl --info <name>"
+        return 2
+    fi
+    validate_server_name "$name" || return 1
+    if ! server_exists "$name"; then
+        log_error "Server '${name}' does not exist."
+        return 1
+    fi
+    local conf dir
+    conf="$(server_conf_path "$name")"
+    dir="$(server_dir "$name")"
+    printf 'Name:          %s\n' "$name"
+    printf 'Directory:     %s\n' "$dir"
+    printf 'Version:       %s\n' "$(conf_get "$conf" MC_VERSION 2>/dev/null || printf '?')"
+    printf 'Paper build:   %s\n' "$(conf_get "$conf" PAPER_BUILD 2>/dev/null || printf '?')"
+    printf 'Memory:        %s\n' "$(conf_get "$conf" MEMORY 2>/dev/null || printf '?')"
+    printf 'Server port:   %s\n' "$(conf_get "$conf" SERVER_PORT 2>/dev/null || printf '?')"
+    printf 'RCON port:     %s (127.0.0.1 only)\n' "$(conf_get "$conf" RCON_PORT 2>/dev/null || printf '?')"
+    printf 'Java:          %s\n' "$(conf_get "$conf" JAVA_BIN 2>/dev/null || printf '?')"
+    printf 'JVM flags:     %s\n' "$(conf_get "$conf" JVM_FLAGS 2>/dev/null || printf '?')"
+    local status="stopped"
+    if service_is_active "$name" 2>/dev/null; then status="running"; fi
+    printf 'Status:        %s\n' "$status"
+    local jar="${dir}/server.jar"
+    if [[ -f "$jar" ]]; then
+        printf 'JAR size:      %s\n' "$(du -h "$jar" 2>/dev/null | cut -f1)"
+    fi
+    local backups
+    backups="$(ls -1 "${CRAFTCTL_BACKUP_ROOT}/${name}" 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'Backups:       %s\n' "${backups:-0}"
+}

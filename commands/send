@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# craftctl command: send
+# shellcheck shell=bash
+
+cmd_send() {
+    local name="${1:-}"
+    if [[ -z "$name" || "$name" == -* ]]; then
+        log_error "Usage: craftctl --send <name> <command...>"
+        return 2
+    fi
+    shift || true
+    if [[ $# -eq 0 ]]; then
+        log_error "Usage: craftctl --send <name> <command...>"
+        return 2
+    fi
+    validate_server_name "$name" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    if ! service_is_active "$name" 2>/dev/null; then
+        log_error "Server '${name}' is not running. Start it first."
+        return 1
+    fi
+    if ! rcon_available; then
+        log_error "No RCON client available (need 'mcrcon' or 'python3')."
+        return 1
+    fi
+    local out rc
+    out="$(rcon_send "$name" "$*")" || rc=$? || rc=$?
+    rc=${rc:-0}
+    if [[ $rc -ne 0 ]]; then
+        log_error "Failed to send command to '${name}'."
+        [[ -n "${out:-}" ]] && printf '%s\n' "$out" >&2
+        return 1
+    fi
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+}

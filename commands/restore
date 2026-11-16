@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# craftctl command: restore
+# shellcheck shell=bash
+
+cmd_restore() {
+    local name="" file="" yes=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file) file="${2:-}"; shift 2 ;;
+            --file=*) file="${1#--file=}"; shift ;;
+            --yes|-y) yes=1; shift ;;
+            --help|-h) printf 'Usage: craftctl --restore <name> [--file FILE] [--yes]\n'; return 0 ;;
+            -*) log_error "Unknown option for --restore: $1"; return 2 ;;
+            *) if [[ -z "$name" ]]; then name="$1"; else log_error "Unexpected argument: $1"; return 2; fi; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || { log_error "Usage: craftctl --restore <name> [--file FILE] [--yes]"; return 2; }
+    validate_server_name "$name" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    if [[ -z "$file" ]]; then
+        file="$(_latest_backup "$name")" || { log_error "No backups found for '${name}'."; return 1; }
+        log_info "Using latest backup: ${file}"
+    fi
+    [[ -f "$file" ]] || { log_error "Backup file not found: ${file}"; return 1; }
+    # Safety: backup file must be inside our backup root or explicitly given absolute path.
+    if [[ "$file" != /* ]]; then
+        log_error "Backup --file must be an absolute path."
+        return 1
+    fi
+    if service_is_active "$name" 2>/dev/null; then
+        log_error "Server '${name}' is running. Stop it first: craftctl --stop ${name}"
+        return 1
+    fi
+    if [[ $yes -ne 1 ]]; then
+        log_warn "This will OVERWRITE the world and configuration for '${name}'."
+        log_warn "Current data will be replaced by: ${file}"
+        if ! prompt_yes_no "Restore backup for '${name}'?" "n"; then
+            log_info "Aborted."
+            return 0
+        fi
+    fi
+    with_server_lock "$name" _do_restore "$name" "$file"
+}
+
+_latest_backup() {
+    local name="$1"
+    ls -1t "${CRAFTCTL_BACKUP_ROOT}/${name}"/"${name}"-*.tar.gz 2>/dev/null | head -n 1
+}
+
+_do_restore() {
+    local name="$1" file="$2"
+    local dir
+    dir="$(server_dir "$name")"
+    case "$dir" in
+        "${CRAFTCTL_DATA}/"*) ;;
+        *) log_error "Refusing to restore into unexpected path: ${dir}"; return 1 ;;
+    esac
+    if ! tar -tzf "$file" >/dev/null 2>&1; then
+        log_error "Backup file is corrupt or not a valid tar.gz: ${file}"
+        return 1
+    fi
+    # Safety copy of current world before overwriting.
+    local safety
+    safety="${CRAFTCTL_BACKUP_ROOT}/${name}/${name}-pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+    log_info "Creating safety backup of current state..."
+    if ! tar -czf "$safety" --exclude='./logs' -C "$dir" ./ 2>/dev/null; then
+        log_warn "Could not create pre-restore safety backup (continuing)."
+        safety=""
+    else
+        log_info "Safety backup: ${safety}"
+    fi
+    log_info "Restoring ${file} into ${dir}..."
+    # Extract over the directory, preserving ownership afterwards.
+    if is_root; then
+        if ! runuser -u "$CRAFTCTL_MC_USER" -- tar -xzf "$file" -C "$dir" 2>/dev/null; then
+            log_error "Restore failed."
+            return 1
+        fi
+        chown -R "${CRAFTCTL_MC_USER}:root" "$dir" 2>/dev/null || true
+    else
+        if ! tar -xzf "$file" -C "$dir"; then
+            log_error "Restore failed."
+            return 1
+        fi
+    fi
+    log_ok "Server '${name}' restored from ${file}."
+    if [[ -n "$safety" ]]; then
+        log_info "Previous state preserved in: ${safety}"
+    fi
+}

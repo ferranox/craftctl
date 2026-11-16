@@ -1,0 +1,12 @@
+# Runtime data created by craftctl (never commit).
+/var/
+*.log
+*.tar.gz
+# Local dev overrides.
+/tmp/
+# Editor noise.
+*.swp
+*~
+.DS_Store
+# Bats temp artefacts.
+tests/tmp/

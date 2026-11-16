@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# craftctl uninstaller.
+# Safe by default: removes application files + systemd integration but KEEPS
+# worlds, configs and backups. Use --purge to delete everything (with confirmation).
+set -u
+
+APP_ROOT="/opt/craftctl"
+BIN_PATH="/usr/local/bin/craftctl"
+ETC_DIR="/etc/craftctl"
+DATA_ROOT="/var/lib/craftctl"
+BACKUP_ROOT="/var/backups/craftctl"
+UNIT="craftctl@.service"
+# NOTE: the 'minecraft' system user is intentionally left in place on
+# uninstall (harmless; may still own kept data files).
+
+PURGE=0
+for arg in "$@"; do
+    case "$arg" in
+        --purge) PURGE=1 ;;
+        --help|-h)
+            printf 'Usage: uninstall [--purge]\n'
+            printf '  Default keeps %s, %s and %s.\n' "$DATA_ROOT" "$BACKUP_ROOT" "$ETC_DIR"
+            printf '  --purge also deletes server data and backups after confirmation.\n'
+            exit 0
+            ;;
+        *) printf '[error] Unknown option: %s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+
+info() { printf '[info] %s\n' "$*"; }
+ok()   { printf '[ok] %s\n' "$*"; }
+warn() { printf '[warn] %s\n' "$*" >&2; }
+
+need_root() {
+    if [[ "$(id -u)" -eq 0 ]]; then "$@"; else sudo "$@"; fi
+}
+
+# Confirm helper that works when piped.
+confirm() {
+    local prompt="$1"
+    printf '%s [y/N]: ' "$prompt" >&2
+    local ans=""
+    IFS= read -r ans || ans=""
+    case "$ans" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Stop all servers first.
+if command -v systemctl >/dev/null 2>&1; then
+    info "Stopping craftctl services..."
+    for unit in $(systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^craftctl@.+\.service' || true); do
+        info "Stopping ${unit}..."
+        need_root systemctl stop "$unit" 2>/dev/null || true
+        need_root systemctl disable "$unit" 2>/dev/null || true
+    done
+fi
+
+info "Removing systemd service template..."
+need_root rm -f "/etc/systemd/system/${UNIT}" || true
+if command -v systemctl >/dev/null 2>&1; then
+    need_root systemctl daemon-reload 2>/dev/null || true
+    need_root systemctl reset-failed 2>/dev/null || true
+fi
+
+info "Removing application files (${APP_ROOT}, ${BIN_PATH})..."
+need_root rm -rf "$APP_ROOT" || true
+need_root rm -f "$BIN_PATH" || true
+
+if [[ "$PURGE" -eq 1 ]]; then
+    warn "You requested --purge: this will DELETE ALL server worlds, configs and backups."
+    warn "  ${DATA_ROOT}"
+    warn "  ${BACKUP_ROOT}"
+    warn "  ${ETC_DIR}"
+    if ! confirm "Permanently delete ALL craftctl data?"; then
+        info "Purge cancelled. Application files were still removed; data was kept."
+        exit 0
+    fi
+    if ! confirm "Are you absolutely sure? There is no undo."; then
+        info "Purge cancelled. Data was kept."
+        exit 0
+    fi
+    need_root rm -rf "$DATA_ROOT" "$BACKUP_ROOT" "$ETC_DIR" || true
+    ok "craftctl purged completely, including worlds and backups."
+else
+    ok "craftctl removed. Kept (safe default):"
+    info "  Server data: ${DATA_ROOT}"
+    info "  Backups:     ${BACKUP_ROOT}"
+    info "  Config:      ${ETC_DIR}"
+    info "To delete data as well, run: uninstall --purge"
+fi
+
+# Note: the 'minecraft' user is intentionally left in place (harmless, may own
+# remaining data files). Remove manually with: sudo userdel minecraft

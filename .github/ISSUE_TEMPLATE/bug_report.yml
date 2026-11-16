@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a problem with craftctl
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please include the diagnostics below so the issue can be reproduced.
+  - type: input
+    id: version
+    attributes:
+      label: craftctl version
+      description: Output of `craftctl --version`
+      placeholder: craftctl 1.0.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      description: Output of `cat /etc/os-release; uname -m`
+      placeholder: Raspberry Pi OS Lite 64-bit, aarch64
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you run, and what went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant `journalctl -u craftctl@<name>` or `craftctl --logs <name>` excerpt (redact RCON passwords — they are never logged by craftctl, but double-check pasted server.properties).
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I am not running as root and used a sudo-capable user
+        - label: systemd is running (`/run/systemd/system` exists)
+        - label: I checked docs/troubleshooting.md

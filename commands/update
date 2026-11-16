@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# craftctl commands: self-update (craftctl --update), server update and uninstall
+# shellcheck shell=bash
+
+cmd_self_update() {
+    log_info "Updating craftctl from ${CRAFTCTL_REPO}..."
+    local tmpdir
+    tmpdir="$(mktemp_dir)" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+    local url="${CRAFTCTL_RAW_BASE}/main/install"
+    # Prefer git when the install root is a checkout; otherwise re-run installer.
+    if [[ -d "${CRAFTCTL_ROOT}/.git" ]]; then
+        log_info "Git checkout detected; pulling latest..."
+        if ! git -C "$CRAFTCTL_ROOT" pull --ff-only; then
+            log_error "git pull failed."
+            return 1
+        fi
+        log_ok "craftctl updated via git."
+        return 0
+    fi
+    log_info "Downloading latest installer..."
+    local installer="${tmpdir}/install"
+    if has_cmd curl; then
+        curl -fsSL -o "$installer" "$url" || { log_error "Download failed."; return 1; }
+    elif has_cmd wget; then
+        wget -qO "$installer" "$url" || { log_error "Download failed."; return 1; }
+    else
+        log_error "Neither curl nor wget is available."
+        return 1
+    fi
+    bash "$installer" --update-only || {
+        # Older installer without flags: run full installer (idempotent, preserves data).
+        bash "$installer" || return 1
+    }
+    log_ok "craftctl updated. Worlds, configs and backups were preserved."
+}
+
+cmd_update_server() {
+    local name="" mc_version=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) mc_version="${2:-}"; shift 2 ;;
+            --version=*) mc_version="${1#--version=}"; shift ;;
+            --help|-h) printf 'Usage: craftctl --update-server <name> [--version VER]\n'; return 0 ;;
+            -*) log_error "Unknown option for --update-server: $1"; return 2 ;;
+            *) if [[ -z "$name" ]]; then name="$1"; else log_error "Unexpected argument: $1"; return 2; fi; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || { log_error "Usage: craftctl --update-server <name> [--version VER]"; return 2; }
+    validate_server_name "$name" || return 1
+    server_exists "$name" || { log_error "Server '${name}' does not exist."; return 1; }
+    with_server_lock "$name" _do_update_server "$name" "$mc_version"
+}
+
+_do_update_server() {
+    local name="$1" mc_version="$2"
+    local conf dir cur_ver cur_build
+    conf="$(server_conf_path "$name")"
+    dir="$(server_dir "$name")"
+    cur_ver="$(conf_get "$conf" MC_VERSION 2>/dev/null || true)"
+    cur_build="$(conf_get "$conf" PAPER_BUILD 2>/dev/null || true)"
+    if [[ -z "$mc_version" ]]; then
+        mc_version="$cur_ver"
+    fi
+    validate_version "$mc_version" || return 1
+    papermc_version_exists "$mc_version" || { log_error "PaperMC version '${mc_version}' does not exist."; return 1; }
+
+    local was_running=0
+    if service_is_active "$name" 2>/dev/null; then
+        was_running=1
+        log_info "Server is running; it will be stopped for the update and restarted afterwards."
+        rcon_send "$name" "save-all" >/dev/null 2>&1 || true
+        service_stop "$name" || return 1
+        wait_for_state "$name" inactive 60 2>/dev/null || true
+    fi
+
+    # Safety backup before replacing the JAR.
+    log_info "Creating pre-update backup..."
+    _do_backup_inline "$name" || log_warn "Pre-update backup failed; continuing anyway."
+
+    local build
+    build="$(papermc_latest_stable_build "$mc_version")" || { [[ $was_running -eq 1 ]] && service_start "$name" 2>/dev/null || true; return 1; }
+    if [[ "$mc_version" == "$cur_ver" && "$build" == "$cur_build" ]]; then
+        log_info "Server '${name}' is already on the latest STABLE build (${mc_version} build ${build})."
+        [[ $was_running -eq 1 ]] && service_start "$name" 2>/dev/null || true
+        return 0
+    fi
+
+    # Java may need to change with the version.
+    local java_major java_bin cur_java
+    java_major="$(java_required_for_mc "$mc_version")" || return 1
+    cur_java="$(conf_get "$conf" JAVA_BIN 2>/dev/null || true)"
+    if java_bin="$(find_java_for_major "$java_major" 2>/dev/null)"; then
+        :
+    else
+        log_info "Installing Java ${java_major} for Paper ${mc_version}..."
+        java_bin="$(install_java_for_major "$java_major")" || return 1
+    fi
+
+    local tmpjar
+    tmpjar="$(mktemp_dir)/server.jar" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$(dirname "$tmpjar")'" RETURN
+    papermc_download_jar "$mc_version" "$build" "$tmpjar" || { [[ $was_running -eq 1 ]] && service_start "$name" 2>/dev/null || true; return 1; }
+    trap - RETURN
+    cp "$tmpjar" "${dir}/server.jar.new" || return 1
+    mv -f "${dir}/server.jar.new" "${dir}/server.jar" || return 1
+    rm -rf "$(dirname "$tmpjar")"
+    if is_root && id "$CRAFTCTL_MC_USER" >/dev/null 2>&1; then
+        chown "${CRAFTCTL_MC_USER}:root" "${dir}/server.jar" 2>/dev/null || true
+    fi
+
+    conf_set "$conf" MC_VERSION "$mc_version" || return 1
+    conf_set "$conf" PAPER_BUILD "$build" || return 1
+    if [[ "$java_bin" != "$cur_java" ]]; then
+        conf_set "$conf" JAVA_BIN "$java_bin" || return 1
+        log_info "Java executable updated: ${java_bin}"
+    fi
+
+    if [[ $was_running -eq 1 ]]; then
+        service_start "$name" || { log_error "Update applied but restart failed."; return 1; }
+    fi
+    log_ok "Server '${name}' updated to PaperMC ${mc_version} build ${build}."
+}
+
+# Inline backup used by update-server (no nested locking).
+_do_backup_inline() {
+    local name="$1"
+    local dir backup_dir ts file online=0
+    dir="$(server_dir "$name")"
+    backup_dir="${CRAFTCTL_BACKUP_ROOT}/${name}"
+    mkdir -p "$backup_dir" 2>/dev/null || need_root mkdir -p "$backup_dir" || return 1
+    ts="$(date +%Y%m%d-%H%M%S)"
+    file="${backup_dir}/${name}-${ts}.tar.gz"
+    if service_is_active "$name" 2>/dev/null; then online=1; fi
+    if [[ $online -eq 1 ]]; then
+        rcon_send "$name" "save-off" >/dev/null 2>&1 || true
+        rcon_send "$name" "save-all flush" >/dev/null 2>&1 || rcon_send "$name" "save-all" >/dev/null 2>&1 || true
+        sleep 2
+    fi
+    tar -czf "$file" --exclude='./logs' -C "$dir" ./ 2>/dev/null
+    local rc=$?
+    [[ $online -eq 1 ]] && rcon_send "$name" "save-on" >/dev/null 2>&1 || true
+    if [[ $rc -ne 0 ]]; then rm -f "$file"; return 1; fi
+    tar -tzf "$file" >/dev/null 2>&1 || { rm -f "$file"; return 1; }
+    log_info "Pre-update backup: ${file}"
+    load_global_config
+    _prune_backups "$name" "${BACKUP_RETENTION:-7}" 2>/dev/null || true
+}
+
+cmd_uninstall() {
+    local purge=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --purge) purge=1; shift ;;
+            --help|-h) printf 'Usage: craftctl --uninstall [--purge]\n'; printf '  Without --purge, worlds and backups are kept.\n'; return 0 ;;
+            *) log_error "Unknown option for --uninstall: $1"; return 2 ;;
+        esac
+    done
+    local installer="${CRAFTCTL_ROOT}/uninstall"
+    if [[ ! -f "$installer" ]]; then
+        # Fall back to downloading the uninstaller.
+        local tmp
+        tmp="$(mktemp)" || return 1
+        # shellcheck disable=SC2064
+        trap "rm -f '$tmp'" RETURN
+        if has_cmd curl; then
+            curl -fsSL -o "$tmp" "${CRAFTCTL_RAW_BASE}/main/uninstall" || { log_error "Could not download uninstaller."; return 1; }
+        elif has_cmd wget; then
+            wget -qO "$tmp" "${CRAFTCTL_RAW_BASE}/main/uninstall" || { log_error "Could not download uninstaller."; return 1; }
+        else
+            log_error "Neither curl nor wget available."
+            return 1
+        fi
+        if [[ $purge -eq 1 ]]; then
+            bash "$tmp" --purge
+        else
+            bash "$tmp"
+        fi
+        return $?
+    fi
+    if [[ $purge -eq 1 ]]; then
+        bash "$installer" --purge
+    else
+        bash "$installer"
+    fi
+}

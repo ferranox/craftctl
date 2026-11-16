@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# craftctl installer - pipeable via:
+#   wget -qO- https://raw.githubusercontent.com/ferranox/craftctl/main/install | bash
+#   curl -fsSL https://raw.githubusercontent.com/ferranox/craftctl/main/install | bash
+#
+# Must not rely on argv-zero, CWD or script location: everything is downloaded
+# into a temporary staging directory.
+set -euo pipefail
+
+REPO="https://github.com/ferranox/craftctl"
+TARBALL="https://github.com/ferranox/craftctl/archive/refs/heads/main.tar.gz"
+
+APP_ROOT="/opt/craftctl"
+BIN_PATH="/usr/local/bin/craftctl"
+ETC_DIR="/etc/craftctl"
+DATA_DIR="/var/lib/craftctl/servers"
+BACKUP_DIR="/var/backups/craftctl"
+SYSTEMD_DIR="/etc/systemd/system"
+MC_USER="minecraft"
+
+UPDATE_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --update-only) UPDATE_ONLY=1 ;;
+        --help|-h)
+            printf 'Usage: install [--update-only]\n'
+            printf 'Installs craftctl from %s\n' "$REPO"
+            exit 0
+            ;;
+    esac
+done
+
+info()  { printf '[info] %s\n' "$*"; }
+ok()    { printf '[ok] %s\n' "$*"; }
+warn()  { printf '[warn] %s\n' "$*" >&2; }
+fatal() { printf '[error] %s\n' "$*" >&2; exit 1; }
+
+cleanup() {
+    if [[ -n "${STAGE:-}" && -d "${STAGE:-}" ]]; then
+        rm -rf "$STAGE"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# --- 1. Must not run as root -------------------------------------------------
+if [[ "$(id -u)" -eq 0 ]]; then
+    fatal "Do not run the installer as root. Run as a normal user with sudo access."
+fi
+if ! command -v sudo >/dev/null 2>&1; then
+    fatal "'sudo' is required but not installed. Install sudo and re-run."
+fi
+
+# --- 2/3/4. OS, arch, systemd ------------------------------------------------
+if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+else
+    fatal "Cannot detect OS (/etc/os-release missing)."
+fi
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64|amd64) ARCH_NORM="x86_64" ;;
+    aarch64|arm64) ARCH_NORM="aarch64" ;;
+    *) fatal "Unsupported architecture '${ARCH}'. Only 64-bit x86_64 and aarch64 are supported." ;;
+esac
+case "$OS_ID" in
+    debian|ubuntu|raspbian) info "Detected OS: ${OS_ID} (${ARCH_NORM})" ;;
+    *) fatal "Unsupported distribution '${OS_ID}'. Supported: Debian, Ubuntu Server, Raspberry Pi OS Lite (64-bit). See docs/installation.md." ;;
+esac
+if [[ ! -d /run/systemd/system ]]; then
+    fatal "systemd does not appear to be running (no /run/systemd/system)."
+fi
+command -v systemctl >/dev/null 2>&1 || fatal "'systemctl' not found."
+
+# --- 5. Dependencies ----------------------------------------------------------
+info "Installing dependencies (via APT)..."
+sudo apt-get update -y
+to_install=()
+command -v curl >/dev/null 2>&1 || to_install+=(curl)
+command -v wget >/dev/null 2>&1 || to_install+=(wget)
+command -v git >/dev/null 2>&1 || to_install+=(git)
+command -v jq >/dev/null 2>&1 || to_install+=(jq)
+command -v tar >/dev/null 2>&1 || to_install+=(tar)
+command -v gzip >/dev/null 2>&1 || to_install+=(gzip)
+command -v openssl >/dev/null 2>&1 || to_install+=(openssl)
+to_install+=(ca-certificates procps findutils coreutils)
+# de-duplicate while preserving order
+uniq=()
+for p in "${to_install[@]}"; do
+    skip=0
+    for q in "${uniq[@]}"; do [[ "$p" == "$q" ]] && skip=1; done
+    [[ $skip -eq 0 ]] && uniq+=("$p")
+done
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${uniq[@]}"
+
+# --- 6/7. minecraft user + directories ----------------------------------------
+if ! id "$MC_USER" >/dev/null 2>&1; then
+    info "Creating system user '${MC_USER}'..."
+    sudo useradd --system --home-dir /var/lib/craftctl \
+        --shell /usr/sbin/nologin --comment "craftctl Minecraft server user" \
+        "$MC_USER"
+else
+    info "User '${MC_USER}' already exists."
+fi
+sudo mkdir -p "$APP_ROOT" "$ETC_DIR/servers" "$DATA_DIR" "$BACKUP_DIR" /var/lock/craftctl
+sudo chown -R "${MC_USER}:root" "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+sudo chown -R "root:${MC_USER}" "$ETC_DIR" 2>/dev/null || true
+sudo chmod 2750 "$ETC_DIR" "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+
+# --- 8/9. Download + install application files --------------------------------
+STAGE="$(mktemp -d /tmp/craftctl-install.XXXXXX)"
+if [[ -n "${CRAFTCTL_SOURCE_DIR:-}" && -d "${CRAFTCTL_SOURCE_DIR:-}" ]]; then
+    info "Using local source: ${CRAFTCTL_SOURCE_DIR}"
+    cp -a "${CRAFTCTL_SOURCE_DIR}/." "$STAGE/source/"
+else
+    info "Downloading craftctl from ${REPO}..."
+    mkdir -p "$STAGE/source"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$STAGE/repo.tar.gz" "$TARBALL" \
+            || fatal "Download failed. Check network access to github.com."
+    else
+        wget -qO "$STAGE/repo.tar.gz" "$TARBALL" \
+            || fatal "Download failed. Check network access to github.com."
+    fi
+    tar -xzf "$STAGE/repo.tar.gz" -C "$STAGE/source" --strip-components=1 \
+        || fatal "Failed to extract craftctl archive (download may be corrupt)."
+fi
+SRC="$STAGE/source"
+if [[ -n "${CRAFTCTL_SOURCE_DIR:-}" ]]; then
+    SRC="${CRAFTCTL_SOURCE_DIR}"
+fi
+[[ -f "$SRC/craftctl" ]] || fatal "Downloaded archive is missing the 'craftctl' executable."
+[[ -f "$SRC/api" ]] || fatal "Downloaded archive is missing the 'api' file."
+
+info "Installing application files to ${APP_ROOT}..."
+sudo mkdir -p "$APP_ROOT"
+# Preserve existing installation's config: never touch /etc, /var/lib, /var/backups here.
+sudo cp -a "$SRC/craftctl" "$SRC/api" "$APP_ROOT/"
+sudo cp -a "$SRC/commands" "$SRC/lib" "$APP_ROOT/"
+sudo cp -a "$SRC/data" "$APP_ROOT/" 2>/dev/null || true
+sudo cp -a "$SRC/completions" "$APP_ROOT/" 2>/dev/null || true
+if [[ -f "$SRC/uninstall" ]]; then
+    sudo cp -a "$SRC/uninstall" "$APP_ROOT/uninstall"
+fi
+# docs are optional on target but useful for `craftctl` local reference
+sudo cp -a "$SRC/docs" "$APP_ROOT/" 2>/dev/null || true
+sudo chmod 755 "$APP_ROOT/craftctl"
+sudo chmod 755 "$APP_ROOT/api" 2>/dev/null || true
+sudo chmod -R a+rX "$APP_ROOT/commands" "$APP_ROOT/lib" 2>/dev/null || true
+# App files owned by root; server data stays with minecraft user.
+sudo chown -R root:root "$APP_ROOT"
+
+# --- 10/11. Executable + systemd template --------------------------------------
+info "Installing executable to ${BIN_PATH}..."
+sudo cp -a "$APP_ROOT/craftctl" "$BIN_PATH"
+sudo chmod 755 "$BIN_PATH"
+
+if [[ -f "$SRC/systemd/craftctl@.service" ]]; then
+    info "Installing systemd service template..."
+    sudo cp -a "$SRC/systemd/craftctl@.service" "$SYSTEMD_DIR/craftctl@.service"
+    sudo chmod 644 "$SYSTEMD_DIR/craftctl@.service"
+fi
+
+# --- 12/13. Permissions + daemon-reload ----------------------------------------
+sudo chown -R "${MC_USER}:root" "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+sudo systemctl daemon-reload || warn "systemctl daemon-reload failed."
+
+# --- Default global config (never overwrite) -----------------------------------
+if [[ ! -f "$ETC_DIR/craftctl.conf" ]]; then
+    info "Writing default global configuration..."
+    sudo tee "$ETC_DIR/craftctl.conf" >/dev/null <<'EOF'
+# craftctl global configuration
+# https://github.com/ferranox/craftctl
+DEFAULT_VERSION=
+DEFAULT_MEMORY=2G
+DEFAULT_PORT=25565
+BACKUP_RETENTION=7
+JAVA_DIR=
+EOF
+    sudo chmod 644 "$ETC_DIR/craftctl.conf"
+else
+    info "Global configuration already exists; leaving it untouched."
+fi
+
+# --- 14/15. Verify + next steps -------------------------------------------------
+if ! "$BIN_PATH" --version >/dev/null 2>&1; then
+    fatal "Installation verification failed: ${BIN_PATH} --version did not succeed."
+fi
+ok "craftctl installed: $("$BIN_PATH" --version)"
+if [[ "$UPDATE_ONLY" -eq 1 ]]; then
+    ok "Update complete. Worlds, configs and backups were preserved."
+    exit 0
+fi
+cat <<'EOF'
+
+Next steps:
+  1. Initialise the environment:   sudo craftctl --setup
+     (or: craftctl --setup — you will be prompted for sudo as needed)
+  2. Create your first server:      craftctl --create survival
+  3. Start it:                      craftctl --start survival
+  4. Manage whitelist:              craftctl --whitelist add survival <player>
+
+Docs: https://github.com/ferranox/craftctl
+EOF

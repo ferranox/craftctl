@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# craftctl command: delete
+# shellcheck shell=bash
+
+cmd_delete() {
+    local name="" yes=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y) yes=1; shift ;;
+            --help|-h) printf 'Usage: craftctl --delete <name> [--yes]\n'; return 0 ;;
+            -*) log_error "Unknown option for --delete: $1"; return 2 ;;
+            *) if [[ -z "$name" ]]; then name="$1"; else log_error "Unexpected argument: $1"; return 2; fi; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || { log_error "Usage: craftctl --delete <name> [--yes]"; return 2; }
+    validate_server_name "$name" || return 1
+    if ! server_exists "$name"; then
+        log_error "Server '${name}' does not exist."
+        return 1
+    fi
+    if service_is_active "$name" 2>/dev/null; then
+        log_error "Server '${name}' is running. Stop it first: craftctl --stop ${name}"
+        return 1
+    fi
+    if [[ $yes -ne 1 ]]; then
+        log_warn "This will delete server files for '${name}' (world, jar, config)."
+        log_warn "Backups in ${CRAFTCTL_BACKUP_ROOT}/${name} are KEPT."
+        if ! prompt_yes_no "Delete server '${name}'?" "n"; then
+            log_info "Aborted."
+            return 0
+        fi
+    fi
+    with_server_lock "$name" _do_delete "$name"
+}
+
+_do_delete() {
+    local name="$1"
+    local dir
+    dir="$(server_dir "$name")"
+    # Safety: never delete outside CRAFTCTL_DATA.
+    case "$dir" in
+        "${CRAFTCTL_DATA}/"*) ;;
+        *) log_error "Refusing to delete unexpected path: ${dir}"; return 1 ;;
+    esac
+    service_disable "$name" 2>/dev/null || true
+    need_root rm -rf "$dir" || rm -rf "$dir" || return 1
+    need_root rm -f "${CRAFTCTL_ETC}/servers/${name}.rcon" 2>/dev/null || rm -f "${CRAFTCTL_ETC}/servers/${name}.rcon" 2>/dev/null || true
+    log_ok "Server '${name}' deleted. Backups (if any) kept in ${CRAFTCTL_BACKUP_ROOT}/${name}."
+}

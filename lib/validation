@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# craftctl - lib/validation
+# Input validation helpers.
+# shellcheck shell=bash
+
+# Server names: 1-32 chars, letters digits _ -. Must not be "." or "..".
+validate_server_name() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        log_error "Server name must not be empty."
+        return 1
+    fi
+    if [[ ${#name} -gt 32 ]]; then
+        log_error "Invalid server name '${name}': must be 1-32 characters."
+        return 1
+    fi
+    if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        log_error "Invalid server name '${name}': use only letters, digits, '-' and '_'."
+        return 1
+    fi
+    if [[ "$name" == "." || "$name" == ".." ]]; then
+        log_error "Invalid server name '${name}'."
+        return 1
+    fi
+    return 0
+}
+
+# Reject any path traversal attempts for user supplied relative values.
+reject_traversal() {
+    local value="${1:-}"
+    if [[ "$value" == *".."* || "$value" == *"/"* || "$value" == *"\\"* ]]; then
+        log_error "Invalid value '${value}': path separators and '..' are not allowed."
+        return 1
+    fi
+    return 0
+}
+
+validate_username() {
+    local user="${1:-}"
+    if [[ ! "$user" =~ ^[A-Za-z0-9_]{3,16}$ ]]; then
+        log_error "Invalid Minecraft username '${user}': must be 3-16 chars of letters, digits and '_'."
+        return 1
+    fi
+    return 0
+}
+
+validate_version() {
+    local ver="${1:-}"
+    if [[ -z "$ver" ]]; then
+        log_error "Version must not be empty."
+        return 1
+    fi
+    # Accept 1.x[.y] and new date-based 26.x[.y] forms, plus optional suffixes.
+    if [[ ! "$ver" =~ ^(1\.[0-9]+(\.[0-9]+)?|[0-9]{2,}\.[0-9]+(\.[0-9]+)?)([-+._A-Za-z0-9]*)$ ]]; then
+        log_error "Invalid version '${ver}'."
+        return 1
+    fi
+    if [[ "$ver" == *".."* || "$ver" == *"/"* ]]; then
+        log_error "Invalid version '${ver}'."
+        return 1
+    fi
+    return 0
+}
+
+validate_memory() {
+    local mem="${1:-}"
+    if [[ ! "$mem" =~ ^[0-9]+[MGmg]$ ]]; then
+        log_error "Invalid memory value '${mem}': use e.g. 1G, 2048M."
+        return 1
+    fi
+    local num="${mem%[MGmg]}"
+    local unit="${mem: -1}"
+    unit="$(printf '%s' "$unit" | tr '[:lower:]' '[:upper:]')"
+    if [[ "$unit" == "M" ]]; then
+        if [[ "$num" -lt 256 ]]; then
+            log_error "Memory '${mem}' is too small: minimum 256M."
+            return 1
+        fi
+        if [[ "$num" -gt 65536 ]]; then
+            log_error "Memory '${mem}' is too large."
+            return 1
+        fi
+    else
+        if [[ "$num" -lt 1 ]]; then
+            log_error "Memory '${mem}' is too small: minimum 1G."
+            return 1
+        fi
+        if [[ "$num" -gt 64 ]]; then
+            log_error "Memory '${mem}' is too large."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+validate_port() {
+    local port="${1:-}"
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid port '${port}': must be numeric."
+        return 1
+    fi
+    if [[ "$port" -lt 1024 || "$port" -gt 65535 ]]; then
+        log_error "Invalid port '${port}': must be 1024-65535."
+        return 1
+    fi
+    return 0
+}
+
+validate_rcon_port() {
+    validate_port "$1"
+}
+
+validate_absolute_path() {
+    local p="${1:-}"
+    if [[ "$p" != /* ]]; then
+        log_error "Path '${p}' must be absolute."
+        return 1
+    fi
+    return 0
+}
